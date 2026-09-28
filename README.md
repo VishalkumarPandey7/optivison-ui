@@ -145,6 +145,67 @@ Four reviewed images can test the workflow, but they are not sufficient for reli
 - **Old UI still visible:** press `Ctrl + F5`.
 - **RTSP feed is blank:** use an HLS/WebRTC/HTTP bridge rather than the raw RTSP URL.
 
+## Agent and developer handoff
+
+Read this section before changing the project.
+
+### Repository responsibilities
+
+This repository contains the React/TypeScript user interface and browser-side orchestration. The Python inference backend is intentionally kept in the separate sibling project `Opti Vision 2/signal-lab-worker`.
+
+Important frontend files:
+
+- `src/App.tsx` — application shell, navigation, camera setup, monitoring, dashboard, signals/rules, training, notifications, and UI components.
+- `src/vision.tsx` — shared camera state, source connections, independent per-camera engine state, frame capture, worker API calls, detection overlays, metrics, and local persistence.
+- `src/lpr.tsx` — LPR process mapping, identity matching, automatic journey creation, station transitions, summaries, correction/deletion, and lifecycle persistence.
+- `src/templates.ts` — built-in signal and detection-rule templates.
+- `src/styles.css` — complete orange-and-white product styling and responsive layout.
+- `tools/start-optivision-ui.ps1` — zero-command Windows launcher.
+
+Backend files used by this UI are in the sibling worker repository:
+
+- `server.py` — HTTP service on port `8770` and `/analyze` orchestration.
+- `lpr_runtime.py` — Indian number-plate detector and LPRNet OCR adapter.
+- `engine.py` — generic signal and rule evaluation.
+- `conveyor.py` — Supervision/direct-motion conveyor counting.
+- `training.py` and `workspace.py` — customer-model training and persistent workspace state.
+
+### Runtime contract
+
+- Frontend URL: `http://127.0.0.1:4180`.
+- Worker URL: `http://127.0.0.1:8770`.
+- Health/catalog endpoint: `GET /health`.
+- Frame analysis endpoint: `POST /analyze`.
+- Every camera owns its configuration and `running[cameraId]` state; never replace this with one global engine switch.
+- Only explicitly drawn ROIs are sent for analysis.
+- Uploaded video is allowed to finish before looping.
+- Browser camera configuration and lifecycle records currently use local storage; there is no production database yet.
+
+### LPR identity rules
+
+- A valid OCR read at the mapped entry camera starts a journey immediately.
+- Each different plate creates a separate lifecycle, even when several vehicles share the same entry station.
+- The first plate number, saved crop, and fingerprint are locked as that journey’s identity; later noisy frames must not overwrite them.
+- Box position alone must never merge vehicles because different cars pass through the same image location.
+- Downstream scans advance a journey only when plate/image identity matches. An unmatched downstream detection must not corrupt another vehicle’s journey.
+- The mapped end camera completes the matching journey automatically.
+
+### Safe change workflow
+
+1. Preserve the orange-and-white UI structure unless a redesign is explicitly requested.
+2. Keep user monitoring simple; technical configuration belongs to the setup/developer surfaces.
+3. Do not commit `runtime/`, uploaded footage, model weights, training data, `node_modules/`, or `dist/`.
+4. Run `npm run build` after every frontend change.
+5. Verify both URLs and confirm the LPR model reports `installed: true` before sharing a dashboard link.
+6. Test LPR with ordered entry/processing/exit clips and clear stale test records between scenarios.
+
+### Current limitations
+
+- Configuration and lifecycle persistence are browser-local, not database-backed.
+- Raw RTSP/ONVIF feeds require a browser-compatible gateway.
+- OCR accuracy depends on plate size, focus, angle, illumination, and LPR training coverage.
+- Multi-camera throughput depends on CPU/GPU capacity because inference for each camera is processed independently.
+
 ## Verified
 
 - TypeScript production build passes.
