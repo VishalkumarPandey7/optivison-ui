@@ -3,3 +3,10 @@ dist/
 runtime/
 tmp/
 *.log
+worker/.venv/
+worker/models/
+worker/third_party/
+worker/.ultralytics/
+worker/__pycache__/
+worker/**/*.pyc
+.opti-vision-runtime/

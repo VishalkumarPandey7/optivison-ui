@@ -1,10 +1,12 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$workerRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot '..\..\Opti Vision 2\signal-lab-worker'))
+$workerRoot = Join-Path $projectRoot 'worker'
 $workerPython = Join-Path $workerRoot '.venv\Scripts\python.exe'
 $env:OPTIVISION_RUNTIME_DIR = Join-Path $projectRoot 'runtime'
-$env:OPTIVISION_LPR_ROOT = 'C:\Users\visha\OneDrive\Desktop\LPR\Indian_LPR'
+if (-not $env:OPTIVISION_LPR_ROOT) {
+  $env:OPTIVISION_LPR_ROOT = Join-Path $workerRoot 'third_party\Indian_LPR'
+}
 
 function Test-Url([string]$Url) {
   try {
@@ -16,10 +18,11 @@ function Test-Url([string]$Url) {
 }
 
 if (-not (Test-Path -LiteralPath $workerPython)) {
-  Add-Type -AssemblyName PresentationFramework
-  [System.Windows.MessageBox]::Show("OptiVision 2 worker was not found at:`n$workerRoot", 'OptiVision') | Out-Null
-  exit 1
+  Write-Host 'First run detected. Installing the local AI engine...' -ForegroundColor Cyan
+  & (Join-Path $PSScriptRoot 'setup-optivision.ps1')
 }
+
+if (-not (Test-Path -LiteralPath $workerPython)) { throw 'The local AI engine is not installed. Run Setup OptiVision.cmd.' }
 
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $nodeModules = Join-Path $projectRoot 'node_modules'
@@ -44,7 +47,7 @@ if ($buildRequired) {
 }
 
 if (-not (Test-Url 'http://127.0.0.1:8770/health')) {
-  Start-Process -FilePath $workerPython -ArgumentList 'server.py' -WorkingDirectory $workerRoot -WindowStyle Hidden
+  Start-Process -FilePath $workerPython -ArgumentList @('server.py', '--model-dir', (Join-Path $workerRoot 'models')) -WorkingDirectory $workerRoot -WindowStyle Hidden
 }
 
 if (-not (Test-Url 'http://127.0.0.1:4180/')) {

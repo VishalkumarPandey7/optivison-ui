@@ -33,6 +33,7 @@ import {
   Pause,
   Play,
   Plus,
+  Route,
   Save,
   ScanLine,
   Search,
@@ -65,7 +66,7 @@ import {
   type Zone
 } from './vision';
 import { builtInRuleTemplates, builtInSignalTemplates, createSignalFromTemplate, type RuleTemplate, type SignalTemplate } from './templates';
-import { LprPage } from './lpr';
+import { LprCyclePage, LprTrackingPage } from './lpr';
 
 type Page =
   | 'setup-home'
@@ -81,7 +82,8 @@ type Page =
   | 'camera-detail'
   | 'dashboard'
   | 'notifications'
-  | 'lpr';
+  | 'lpr-cycle'
+  | 'lpr-tracking';
 
 const setupNavigation: Array<{ id: Page; label: string; icon: typeof Camera }> = [
   { id: 'setup-home', label: 'Setup overview', icon: Layers3 },
@@ -238,7 +240,7 @@ function EmptyFeed({
 
 function AppHeader({ page, setPage, sidebarOpen, setSidebarOpen }: { page: Page; setPage: (page: Page) => void; sidebarOpen: boolean; setSidebarOpen: (open: boolean) => void }) {
   const vision = useVision();
-  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'lpr' ? 'Lifecycle Management' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'lpr-cycle' ? 'LPR Cycle' : page === 'lpr-tracking' ? 'Lifecycle Tracking' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   return (
     <header className="app-header">
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen(!sidebarOpen)}><Menu size={20} /></button>
@@ -262,7 +264,8 @@ function Sidebar({ page, setPage, open }: { page: Page; setPage: (page: Page) =>
         <span className="nav-label">OPERATIONS</span>
         <button className={page === 'monitoring' || page === 'camera-detail' ? 'active' : ''} type="button" onClick={() => setPage('monitoring')}><MonitorPlay size={18} />User monitoring</button>
         <button className={page === 'dashboard' ? 'active' : ''} type="button" onClick={() => setPage('dashboard')}><Grid2X2 size={18} />Dashboard</button>
-        <button className={page === 'lpr' ? 'active' : ''} type="button" onClick={() => setPage('lpr')}><ScanLine size={18} />Lifecycle Management</button>
+        <button className={page === 'lpr-cycle' ? 'active' : ''} type="button" onClick={() => setPage('lpr-cycle')}><ScanLine size={18} />LPR Cycle</button>
+        <button className={page === 'lpr-tracking' ? 'active' : ''} type="button" onClick={() => setPage('lpr-tracking')}><Route size={18} />Lifecycle Tracking</button>
         <button className={page === 'notifications' ? 'active' : ''} type="button" onClick={() => setPage('notifications')}><Bell size={18} />Notifications {vision.events.length ? <em>{Math.min(99, vision.events.length)}</em> : null}</button>
         <span className="nav-label setup-label">SETUP</span>
         {setupNavigation.map((item) => {
@@ -931,7 +934,8 @@ export function App() {
     if (page === 'training') return <TrainingPage />;
     if (page === 'camera-detail') return <CameraDetail setPage={setPage} />;
     if (page === 'dashboard') return <DashboardPage />;
-    if (page === 'lpr') return <LprPage />;
+    if (page === 'lpr-cycle') return <LprCyclePage />;
+    if (page === 'lpr-tracking') return <LprTrackingPage />;
     if (page === 'notifications') return <NotificationsPage setPage={setPage} />;
     return <MonitoringPage setPage={setPage} />;
   }, [page]);

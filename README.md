@@ -2,7 +2,7 @@
 
 OptiVision is a Windows-first local computer-vision dashboard for worker monitoring, machine monitoring, conveyor counting, customer-model training, and Indian number-plate lifecycle tracking.
 
-The orange-and-white React dashboard runs at `http://127.0.0.1:4180`. Detection is performed locally by the OptiVision 2 Python worker at `http://127.0.0.1:8770`; camera frames are not sent to a cloud service.
+The orange-and-white React dashboard runs at `http://127.0.0.1:4180`. The bundled Python AI worker runs at `http://127.0.0.1:8770`; camera frames are not sent to a cloud service.
 
 ## Main capabilities
 
@@ -16,33 +16,24 @@ The orange-and-white React dashboard runs at `http://127.0.0.1:4180`. Detection 
 - Local custom-model workflow: upload, annotate, choose epochs, train, review, activate, and delete.
 - Indian LPR lifecycle tracking with saved plate crops, independent simultaneous vehicle journeys, station timing, worker timing, plate correction, manual completion, and record deletion.
 
-## Required local folders
-
-Keep the UI and worker in this layout (the names can differ only if you also update `tools/start-optivision-ui.ps1`):
-
-```text
-ChatGPT/
-├─ Opti Vision/
-│  └─ optivision-ui-flow/       <- this repository
-└─ Opti Vision 2/
-   └─ signal-lab-worker/        <- Python detection worker
-```
-
-The LPR model currently expects:
-
-```text
-C:\Users\visha\OneDrive\Desktop\LPR\Indian_LPR
-```
-
-That folder must contain `weights/best_od.pth` and `weights/best_lprnet.pth`. To use another location, change `$env:OPTIVISION_LPR_ROOT` in `tools/start-optivision-ui.ps1`.
-
 ## Prerequisites
 
 Install these once:
 
-1. Node.js with npm.
-2. Python and the prepared OptiVision 2 worker virtual environment.
-3. The Indian LPR files above when number-plate recognition is required.
+1. [Node.js LTS](https://nodejs.org/) with npm.
+2. Python 3.11 or newer (enable **Add Python to PATH** during installation).
+3. [Git for Windows](https://git-scm.com/download/win), used to fetch the Indian LPR model.
+
+The first setup needs an internet connection and several gigabytes of free disk space for PyTorch, Ultralytics, YOLO weights, and LPR weights. Inference and saved data are local after setup.
+
+## Install after cloning
+
+1. Clone or download this repository.
+2. Double-click **`Setup OptiVision.cmd`** once.
+3. Wait until the window says **Setup complete**.
+4. Double-click **`Start OptiVision UI.cmd`** whenever you want to use OptiVision.
+
+Setup creates `worker/.venv`, installs the pinned AI packages, downloads the standard detection/pose models, fetches the Indian LPR detector/OCR files, installs frontend packages, and builds the dashboard. These downloaded files are intentionally not committed to Git because they are large.
 
 ## Easiest way to start
 
@@ -50,29 +41,29 @@ Double-click **`Start OptiVision UI.cmd`**.
 
 The launcher automatically:
 
-1. Installs frontend packages when required.
-2. Builds the latest dashboard when required.
-3. Starts the Python detection worker in the background.
+1. Runs the complete setup automatically if this is the first launch.
+2. Installs frontend packages and rebuilds when required.
+3. Starts the bundled Python AI worker in the background.
 4. Starts the dashboard in the background.
-5. Opens `http://127.0.0.1:4180` in the browser.
+5. Waits for both services and opens `http://127.0.0.1:4180`.
 
-No PowerShell command is required for normal operation. Keep the launcher folder and the OptiVision 2 worker folder in the layout shown above.
+No PowerShell command is required for normal operation. Do not move the `worker` or `tools` folders out of the repository.
 
 ## Manual developer startup
 
 Start the worker:
 
 ```powershell
-cd "C:\Users\visha\OneDrive\Dokumen\ChatGPT\Opti Vision 2\signal-lab-worker"
-$env:OPTIVISION_RUNTIME_DIR = "C:\Users\visha\OneDrive\Dokumen\ChatGPT\Opti Vision\optivision-ui-flow\runtime"
-$env:OPTIVISION_LPR_ROOT = "C:\Users\visha\OneDrive\Desktop\LPR\Indian_LPR"
-.\.venv\Scripts\python.exe server.py
+cd "path\to\optivison-ui"
+$env:OPTIVISION_RUNTIME_DIR = "$PWD\runtime"
+$env:OPTIVISION_LPR_ROOT = "$PWD\worker\third_party\Indian_LPR"
+.\worker\.venv\Scripts\python.exe .\worker\server.py --model-dir .\worker\models
 ```
 
 In another terminal, start the UI:
 
 ```powershell
-cd "C:\Users\visha\OneDrive\Dokumen\ChatGPT\Opti Vision\optivision-ui-flow"
+cd "path\to\optivison-ui"
 npm install
 npm run dev -- --host 127.0.0.1 --port 4180
 ```
@@ -132,15 +123,15 @@ Four reviewed images can test the workflow, but they are not sufficient for reli
 ## Local data and privacy
 
 - Camera configuration and lifecycle journeys are stored in browser local storage.
-- Runtime state and training artifacts are stored locally by the worker.
-- `runtime/`, uploaded temporary files, trained weights, `node_modules/`, and production builds are intentionally excluded from Git.
+- Runtime state and training artifacts are stored locally by the bundled worker.
+- `runtime/`, `worker/.venv/`, `worker/models/`, `worker/third_party/`, uploaded/trained weights, `node_modules/`, and production builds are intentionally excluded from Git.
 - Clearing browser site data removes browser-stored configuration and journey history.
 
 ## Troubleshooting
 
 - **Site cannot be reached:** double-click `Start OptiVision UI.cmd` again and wait for the browser to open.
-- **Signal worker offline:** confirm the OptiVision 2 folder layout and `.venv/Scripts/python.exe`.
-- **LPR model unavailable:** check both weight files and `OPTIVISION_LPR_ROOT`.
+- **Signal worker offline:** run `Setup OptiVision.cmd`, then start again. Check that `worker/.venv/Scripts/python.exe` exists.
+- **LPR model unavailable:** rerun setup and confirm `worker/third_party/Indian_LPR/weights/best_od.pth` and `best_lprnet.pth` exist.
 - **Plate detected but no lifecycle:** confirm that camera is mapped as the Start Station and its engine is running.
 - **Old UI still visible:** press `Ctrl + F5`.
 - **RTSP feed is blank:** use an HLS/WebRTC/HTTP bridge rather than the raw RTSP URL.
@@ -151,7 +142,7 @@ Read this section before changing the project.
 
 ### Repository responsibilities
 
-This repository contains the React/TypeScript user interface and browser-side orchestration. The Python inference backend is intentionally kept in the separate sibling project `Opti Vision 2/signal-lab-worker`.
+This is a self-contained source repository: it includes the React/TypeScript interface, browser-side orchestration, Python inference backend, reproducible dependency pins, and Windows setup/start launchers. Only generated environments, runtime data, and large third-party model weights are downloaded locally.
 
 Important frontend files:
 
@@ -161,14 +152,17 @@ Important frontend files:
 - `src/templates.ts` — built-in signal and detection-rule templates.
 - `src/styles.css` — complete orange-and-white product styling and responsive layout.
 - `tools/start-optivision-ui.ps1` — zero-command Windows launcher.
+- `tools/setup-optivision.ps1` — reproducible frontend/AI setup and model download.
 
-Backend files used by this UI are in the sibling worker repository:
+Bundled backend files are in `worker/`:
 
 - `server.py` — HTTP service on port `8770` and `/analyze` orchestration.
 - `lpr_runtime.py` — Indian number-plate detector and LPRNet OCR adapter.
 - `engine.py` — generic signal and rule evaluation.
 - `conveyor.py` — Supervision/direct-motion conveyor counting.
 - `training.py` and `workspace.py` — customer-model training and persistent workspace state.
+- `requirements.txt` — pinned Python AI dependencies.
+- `download_models.py` — downloads standard Ultralytics detector/pose weights.
 
 ### Runtime contract
 
@@ -195,9 +189,10 @@ Backend files used by this UI are in the sibling worker repository:
 1. Preserve the orange-and-white UI structure unless a redesign is explicitly requested.
 2. Keep user monitoring simple; technical configuration belongs to the setup/developer surfaces.
 3. Do not commit `runtime/`, uploaded footage, model weights, training data, `node_modules/`, or `dist/`.
-4. Run `npm run build` after every frontend change.
-5. Verify both URLs and confirm the LPR model reports `installed: true` before sharing a dashboard link.
-6. Test LPR with ordered entry/processing/exit clips and clear stale test records between scenarios.
+4. Run `python -m unittest discover -s worker -p "test_*.py"` after backend changes.
+5. Run `npm run build` after every frontend change.
+6. Verify both URLs and confirm the LPR model reports `installed: true` before sharing a dashboard link.
+7. Test LPR with ordered entry/processing/exit clips and clear stale test records between scenarios.
 
 ### Current limitations
 
@@ -205,6 +200,8 @@ Backend files used by this UI are in the sibling worker repository:
 - Raw RTSP/ONVIF feeds require a browser-compatible gateway.
 - OCR accuracy depends on plate size, focus, angle, illumination, and LPR training coverage.
 - Multi-camera throughput depends on CPU/GPU capacity because inference for each camera is processed independently.
+- First-run setup downloads large third-party packages and models; those binaries are not stored in this repository.
+- The Indian LPR upstream repository does not currently include a conventional license file. Confirm its licensing terms before commercial distribution.
 
 ## Verified
 
