@@ -520,6 +520,8 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .notifications-list small { color: #9b948e; font-size: 8px; }
 
 /* Live OptiVision runtime */
+.vision-runtime-layer { position: fixed; left: 0; bottom: 0; z-index: -1; width: 2px; height: 2px; overflow: hidden; opacity: .001; pointer-events: none; }
+.vision-runtime-layer video { display: block; width: 2px; height: 2px; }
 .vision-video { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: contain; background: #0b1115; opacity: 0; }
 .vision-video.ready { opacity: 1; }
 .feed-editor { cursor: crosshair; touch-action: none; user-select: none; }
@@ -541,6 +543,11 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .feed-waiting, .feed-error { position: absolute; z-index: 8; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 8px 11px; border-radius: 7px; color: #fff; background: rgba(16,23,28,.84); font-size: 8px; font-weight: 750; white-space: nowrap; }
 .feed-error { bottom: 48px; width: min(430px, 80%); color: #ffd8d8; background: rgba(116,21,28,.9); text-align: center; white-space: normal; }
 .upload-source, .connect-source, .external-source { display: flex; align-items: center; gap: 8px; }
+.upload-source { width: 100%; min-height: 112px; margin-top: 16px; padding: 20px 22px; border: 2px dashed #ff9d57; border-radius: 14px; background: #fff8f2; color: var(--text); display: grid; grid-template-columns: 42px minmax(0, 1fr); grid-template-rows: auto auto; column-gap: 14px; align-content: center; cursor: pointer; transition: border-color .18s ease, background .18s ease, box-shadow .18s ease, transform .18s ease; }
+.upload-source > svg { grid-row: 1 / 3; width: 42px; height: 42px; padding: 10px; border-radius: 11px; background: var(--orange); color: #fff; }
+.upload-source > strong { align-self: end; font-size: 16px; }
+.upload-source > small { align-self: start; margin-top: 4px; color: var(--muted); font-size: 13px; }
+.upload-source:hover, .upload-source:focus-within { border-color: var(--orange); background: #fff3e8; box-shadow: 0 8px 22px rgba(255,107,0,.12); transform: translateY(-1px); }
 .upload-source input[type="file"] { display: none; }
 .external-source { margin-top: 12px; }
 .external-source input { flex: 1; }
@@ -575,7 +582,7 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .template-catalog strong { margin-top: 3px; font-size: 10px; }
 .template-catalog p { margin: 4px 0 0; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .monitor-open { display: block; width: 100%; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
-.engine-summary { display: flex; align-items: center; gap: 12px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.engine-summary { display: none; }
 .engine-summary span { display: grid; gap: 2px; }
 .engine-summary small { color: var(--muted); font-size: 8px; }
 .engine-dot { width: 10px; height: 10px; border-radius: 50%; background: #b8b4af; }
@@ -973,4 +980,280 @@ button:disabled { opacity: .42; cursor: not-allowed; }
   .lm-config > div, .lm-filters, .lm-tracking-kpis, .lm-summary-kpis, .lm-automation-create, .lm-automation-cards, .lm-automation-bottom { grid-template-columns: 1fr; }
   .lm-journey-meta { grid-template-columns: 1fr 1fr; }
   .lm-performance > div { grid-template-columns: 1fr 1fr; }
+}
+
+/* Contextual product flow and monitoring hierarchy */
+.setup-workflow { min-width: 0; margin-bottom: var(--space-5); padding: var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-md); background: #fff; display: flex; align-items: center; gap: var(--space-4); box-shadow: 0 3px 14px rgba(63,42,22,.035); }
+.workflow-context { flex: 0 0 auto; padding: 0 var(--space-3); border-right: 1px solid var(--line); }
+.workflow-context span, .workflow-context strong { display: block; }
+.workflow-context span { color: var(--muted); font-size: var(--text-xs); }
+.workflow-context strong { margin-top: 2px; font-size: var(--text-sm); }
+.workflow-track { min-width: 0; flex: 1; display: flex; align-items: center; overflow-x: auto; scrollbar-width: thin; }
+.workflow-track button { min-width: max-content; min-height: 42px; padding: 0 var(--space-2); border: 0; border-radius: var(--radius-sm); background: transparent; color: #756f69; display: flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+.workflow-track button > span { width: 28px; height: 28px; border-radius: 50%; background: #f4f1ee; display: grid; place-items: center; }
+.workflow-track button small { font-size: var(--text-xs); font-weight: 700; white-space: nowrap; }
+.workflow-track button > svg { color: #bbb3ac; margin: 0 var(--space-1); }
+.workflow-track button:hover { color: var(--ink); background: #faf8f5; }
+.workflow-track button.visited > span { background: #f4f1ee; color: #5d5752; }
+.workflow-track button.active { color: var(--orange-dark); background: var(--orange-soft); }
+.workflow-track button.active > span { background: var(--orange); color: #fff; }
+
+.hierarchy-item > button { flex: 1; min-width: 0; min-height: 100px; border: 1px solid var(--line); border-radius: 13px; padding: 13px; background: #fbfaf8; text-align: left; cursor: pointer; }
+.hierarchy-item > button:hover { border-color: #ffc99e; background: #fffaf6; }
+.hierarchy-item > button > span { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; background: var(--orange-soft); color: var(--orange-dark); margin-bottom: 12px; }
+
+.monitor-title em { margin-top: var(--space-2); color: #817a73; display: flex; align-items: center; gap: 5px; font-size: var(--text-xs); font-style: normal; }
+.monitor-summary { min-height: 84px; padding: 0 var(--space-5); display: grid; grid-template-columns: repeat(4, 1fr); align-items: center; }
+.monitor-summary > div { min-width: 0; padding: var(--space-3) var(--space-5); border-right: 1px solid var(--line); display: grid; grid-template-columns: auto 1fr; column-gap: var(--space-3); align-items: center; }
+.monitor-summary > div:first-child { padding-left: 0; }
+.monitor-summary > div:last-child { padding-right: 0; border-right: 0; }
+.monitor-summary small { grid-column: 1 / -1; color: var(--muted); font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.monitor-summary strong { font-size: 24px; }
+.monitor-summary span { color: var(--muted); font-size: var(--text-sm); }
+
+.automation-status { min-height: 28px; padding: 0 10px; border: 0; border-radius: 999px; background: #f1efed; color: #766f69; font-size: var(--text-xs); font-weight: 800; cursor: pointer; }
+.automation-status.active { background: #eaf8f2; color: #087a58; }
+
+@media (max-width: 900px) {
+  .setup-workflow { align-items: stretch; flex-direction: column; }
+  .workflow-context { padding: 0 0 var(--space-2); border-right: 0; border-bottom: 1px solid var(--line); }
+  .monitor-summary { grid-template-columns: repeat(2, 1fr); padding-block: var(--space-2); }
+  .monitor-summary > div:nth-child(2) { border-right: 0; }
+}
+
+@media (max-width: 640px) {
+  .monitor-summary { grid-template-columns: 1fr; }
+  .monitor-summary > div { padding: var(--space-3) 0; border-right: 0; border-bottom: 1px solid var(--line); }
+  .monitor-summary > div:last-child { border-bottom: 0; }
+}
+
+/* Unified interface system -------------------------------------------------
+   These shared tokens and overrides keep every operational and setup screen
+   on one readable type scale and one spacing rhythm. */
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
+}
+
+body { font-size: var(--text-md); line-height: 1.5; }
+button, input, select, textarea { line-height: 1.35; }
+.app-shell { grid-template-columns: 264px minmax(0, 1fr); }
+.sidebar { padding: var(--space-6) var(--space-4); }
+.brand { gap: var(--space-3); padding: 2px var(--space-3) var(--space-6); }
+.brand small { font-size: 9px; }
+.sidebar nav { gap: var(--space-1); }
+.nav-label { font-size: var(--text-xs); padding: var(--space-5) var(--space-3) var(--space-2); }
+.sidebar nav button { min-height: 44px; padding: 0 var(--space-3); font-size: 14px; }
+.sidebar-footer strong { font-size: 13px; }
+.sidebar-footer small { font-size: var(--text-xs); }
+
+.app-header { height: 76px; padding: 0 var(--space-8); gap: var(--space-4); }
+.app-header h1 { font-size: var(--text-xl); }
+.breadcrumb { font-size: var(--text-xs); }
+.search { min-width: 300px; height: 42px; padding: 0 var(--space-3); }
+.search input { font-size: 13px; }
+.icon-button, .avatar, .mobile-menu { width: 42px; height: 42px; }
+.live-chip { min-height: 36px; height: auto; padding: 0 var(--space-3); font-size: var(--text-xs); }
+
+.content { width: 100%; max-width: 1560px; padding: var(--space-8) var(--space-8) 56px; }
+.page-stack { gap: var(--space-6); }
+.page-title { gap: var(--space-6); }
+.page-title h2, .section-heading h2 { margin-bottom: var(--space-2); font-size: var(--text-2xl); line-height: 1.2; }
+.page-title p, .section-heading p { font-size: 14px; line-height: 1.55; }
+.eyebrow { margin-bottom: var(--space-2); font-size: var(--text-xs); line-height: 1.25; }
+.panel { border-radius: var(--radius-lg); }
+.panel > .section-heading:first-child { padding: var(--space-6) var(--space-6) 0; }
+.section-heading { gap: var(--space-6); }
+.section-heading h3 { font-size: var(--text-lg); }
+.primary, .secondary, .ghost { min-height: 42px; padding: 0 var(--space-4); border-radius: var(--radius-sm); font-size: 13px; }
+.pill { min-height: 26px; padding: 0 10px; font-size: var(--text-xs); }
+
+.wizard-page { display: grid; gap: var(--space-5); }
+.wizard-stepper { padding: var(--space-2) 0; }
+.wizard-stepper button { gap: var(--space-2); }
+.wizard-stepper button span { width: 34px; height: 34px; font-size: var(--text-sm); }
+.wizard-stepper button small { max-width: 105px; font-size: var(--text-xs); line-height: 1.3; }
+.wizard-content { padding: var(--space-8); }
+.wizard-footer { min-height: 72px; padding: var(--space-4) var(--space-6); }
+.wizard-footer > span { font-size: var(--text-sm); }
+.choice-grid { gap: var(--space-3); }
+.choice-grid button { padding: var(--space-4); }
+.choice-grid button small, .field, .inline-status small, .inline-status button { font-size: var(--text-sm); }
+.field { gap: var(--space-2); }
+.field input, .field select, .field textarea, .condition-row select, .duration-row input, .then-row input, .then-row select, .automation-condition select, .automation-condition input, .table-toolbar select, .page-controls select { min-height: 44px; padding-inline: var(--space-3); font-size: 13px; }
+.form-grid { gap: var(--space-4); }
+.feed-empty small, .preview-details span small, .roi-workspace aside small, .model-table small, .signal-library small, .logic-preview small, .review-grid small, .review-grid p, .camera-card-title small, .camera-admin-stats small { font-size: var(--text-xs); }
+.drawing-tools button, .segmented button, .formula-tools button, .review-grid button { font-size: var(--text-xs); }
+.roi-workspace aside strong, .model-table > button, .signal-library strong, .action-grid strong, .camera-admin-stats strong { font-size: var(--text-sm); }
+.model-head, .data-table .table-head, .definition-head { font-size: var(--text-xs); }
+.model-table > button { min-height: 58px; }
+
+.camera-admin-grid, .monitor-grid { gap: var(--space-5); }
+.camera-card-title { padding: var(--space-3) var(--space-5) var(--space-5); }
+.camera-card-title strong, .monitor-title strong { font-size: 15px; }
+.camera-status { font-size: var(--text-xs); }
+.monitor-title { padding: var(--space-4) var(--space-5); }
+.monitor-title small, .camera-parameters small { font-size: var(--text-xs); }
+.camera-parameters strong { font-size: 14px; }
+.detail-heading h2 { font-size: var(--text-2xl); }
+.detail-heading p, .detail-heading > div:first-child > span { font-size: var(--text-sm); }
+.panel-tabs button, .rule-status, .business-value, .display-color-row { font-size: var(--text-sm); }
+.rule-status, .business-value { min-height: 46px; }
+.timeline-row { min-height: 58px; }
+.timeline-row time, .timeline-row strong { font-size: var(--text-sm); }
+.timeline-row small { font-size: var(--text-xs); }
+.camera-error-copy, .training-notice { font-size: var(--text-sm); }
+.engine-summary small, .business-kpis small, .conveyor-evidence small { font-size: var(--text-xs); }
+
+.data-table > * { min-height: 54px; padding: var(--space-3) var(--space-4); font-size: var(--text-sm); }
+.automation-list small, .automation-list p, .automation-list span, .automation-flow select, .automation-flow label, .integration-card > p, .integration-card li, .recipient-row { font-size: var(--text-sm); }
+.definition-head, .definition-row { padding: var(--space-3) var(--space-5); }
+.definition-row { min-height: 66px; font-size: var(--text-sm); }
+.definition-choice small, .template-catalog small, .template-catalog p { font-size: var(--text-xs); }
+.template-catalog strong { font-size: 13px; }
+.template-catalog article { padding: var(--space-4); }
+.dashboard-widget { padding: var(--space-5); }
+.dashboard-widget header small, .big-kpi > small, .chart > div:last-child, .mini-alerts small { font-size: var(--text-xs); }
+.mini-alerts strong, .widget-types strong { font-size: var(--text-sm); }
+.widget-types small, .notifications-list small { font-size: var(--text-xs); }
+.notifications-list p { font-size: var(--text-sm); }
+
+.training-shell, .real-training-shell { border-radius: var(--radius-lg); }
+.training-steps button { min-height: 58px; padding: var(--space-3) var(--space-4); }
+.training-steps button > span { width: 30px; height: 30px; font-size: var(--text-xs); }
+.training-steps strong, .training-projects strong { font-size: var(--text-sm); }
+.training-sidebar-heading small, .training-projects small, .training-project-header p, .training-stat-grid small, .training-guidance small, .annotator > header small, .training-run > div:first-child p, .training-versions > article small, .model-choice-large small, .upload-zone p { font-size: var(--text-xs); }
+.training-projects button { min-height: 52px; padding: var(--space-3); }
+.training-project-header { gap: var(--space-4); }
+.training-project-header h2 { font-size: var(--text-xl); }
+.training-stat-grid { gap: var(--space-3); }
+.training-stat-grid article { min-height: 84px; padding: var(--space-4); }
+.training-guidance { padding: var(--space-3) var(--space-4); }
+.danger-button { min-height: 40px; padding: 0 var(--space-3); font-size: var(--text-sm); }
+.training-empty p { font-size: var(--text-sm); }
+.class-list article, .training-versions > article { padding: var(--space-3); }
+
+.lpr-kpis small, .lpr-stage label small, .lpr-stage .lpr-check, .lpr-test p, .lpr-verification > article span:last-child small, .lpr-journeys > button small, .lpr-history-list > button span:last-child small, .lpr-summary > header p, .lpr-visit-grid small, .lpr-visit-grid em, .lpr-event-list time, .lpr-event-list small { font-size: var(--text-xs); }
+.lpr-stage { padding: var(--space-4); }
+.lpr-stage input, .lpr-stage select, .lpr-test input, .lpr-test select { min-height: 42px; font-size: 13px; }
+.lpr-test { gap: var(--space-3); padding: var(--space-5); }
+.lpr-journeys > button, .lpr-history-list > button { min-height: 54px; padding: var(--space-3); }
+
+/* LPR lifecycle uses the same readable product scale as the rest of OptiVision. */
+.lm-navigation { gap: var(--space-1); margin-bottom: var(--space-5); padding: var(--space-1); }
+.lm-navigation button { min-height: 40px; padding: 0 var(--space-4); font-size: var(--text-sm); }
+.lifecycle-workspace-nav { width: 100%; margin-top: 0; align-items: center; }
+.lifecycle-workspace-nav > span { margin: 0 auto 0 var(--space-3); color: var(--muted); font-size: var(--text-xs); font-weight: 800; letter-spacing: .45px; text-transform: uppercase; }
+.lifecycle-workspace-menu { position: relative; display: flex; justify-content: flex-end; margin-bottom: var(--space-5); }
+.lifecycle-menu-trigger { display: inline-flex; align-items: center; gap: var(--space-2); min-height: 42px; padding: 0 var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); font-size: var(--text-sm); font-weight: 750; box-shadow: var(--shadow-xs); cursor: pointer; }
+.lifecycle-menu-trigger:hover, .lifecycle-menu-trigger[aria-expanded="true"] { border-color: var(--orange-300); background: var(--orange-50); color: var(--orange-700); }
+.lifecycle-menu-trigger > svg:last-child { transition: transform .18s ease; }
+.lifecycle-menu-trigger > svg:last-child.open { transform: rotate(180deg); }
+.lifecycle-menu-popover { position: absolute; z-index: 30; top: calc(100% + var(--space-2)); right: 0; display: grid; width: min(320px, calc(100vw - 48px)); padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--shadow-lg); }
+.lifecycle-menu-popover button { display: grid; grid-template-columns: 20px 1fr; gap: var(--space-3); align-items: start; padding: var(--space-3); border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
+.lifecycle-menu-popover button:hover, .lifecycle-menu-popover button.active { background: var(--orange-50); color: var(--orange-700); }
+.lifecycle-menu-popover button svg { margin-top: 2px; }
+.lifecycle-menu-popover button span { display: grid; gap: 2px; }
+.lifecycle-menu-popover button strong { font-size: var(--text-sm); }
+.lifecycle-menu-popover button small { color: var(--muted); font-size: var(--text-xs); font-weight: 500; }
+.lm-stack { gap: var(--space-4); }
+.lifecycle-module, .lm-stack, .lm-card, .lm-mapping, .lm-table-wrap { min-width: 0; max-width: 100%; }
+.lm-page-head { gap: var(--space-6); }
+.lm-page-head > div:last-child { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.lm-page-head > div:first-child > span { font-size: var(--text-xs); }
+.lm-page-head h2 { margin: var(--space-2) 0 var(--space-1); font-size: var(--text-2xl); }
+.lm-page-head p { font-size: 14px; }
+/* The app header and LPR tabs already provide location context. Avoid repeating
+   the same breadcrumb/title again inside each lifecycle screen. */
+.lifecycle-module .lm-page-head > div:first-child > span { display: none; }
+.lifecycle-module .lm-stack:has(> .lm-filters) > .lm-page-head { display: none; }
+.lm-primary, .lm-secondary, .lm-danger { min-height: 42px; padding: 0 var(--space-4); font-size: var(--text-sm); }
+.lm-card { border-radius: var(--radius-md); }
+.lm-card h3 { font-size: var(--text-lg); line-height: 1.35; }
+.lm-card p { margin-top: var(--space-1); font-size: var(--text-sm); line-height: 1.45; }
+.lm-toast { padding: var(--space-3) var(--space-4); font-size: var(--text-sm); }
+.lm-warning { padding: var(--space-3) var(--space-4); }
+.lm-warning small { font-size: var(--text-xs); }
+.lm-plate-readings, .lm-config, .lm-mapping, .lm-entries, .lm-live-panel, .lm-performance, .lm-sequence, .lm-station-summary, .lm-captured-log, .lm-active-automations, .lm-triggers { padding: var(--space-5); }
+.lm-plate-readings article { padding: var(--space-3); }
+.lm-plate-readings article span:last-child small { font-size: var(--text-xs); }
+.lm-config > h3 { margin-bottom: var(--space-4); }
+.lm-config > div { gap: var(--space-5); }
+.lm-config label > span, .lm-filters label > span, .lm-automation-create label > span, .lm-auto-grid label > span { margin-bottom: var(--space-2); font-size: var(--text-xs); }
+.lm-config input, .lm-config select, .lm-filters input, .lm-filters select, .lm-automation-create select, .lm-auto-grid select { min-height: 42px; padding: 0 var(--space-3); font-size: 13px; }
+.lm-config aside { min-height: 48px; padding: var(--space-2) var(--space-4); font-size: var(--text-xs); }
+.lm-flow-settings label > div small { font-size: var(--text-xs); }
+.lm-table-wrap th { height: 40px; padding: 0 var(--space-3); font-size: var(--text-xs); }
+.lm-table-wrap td { height: 48px; padding: var(--space-2) var(--space-3); font-size: var(--text-sm); }
+.lm-mapping td input, .lm-mapping td select { min-height: 36px; padding: 0 var(--space-2); font-size: var(--text-sm); }
+.lm-row-actions button { width: 34px; height: 34px; }
+.lm-status, .lm-badge, .lm-live { padding: 5px 10px; font-size: var(--text-xs); }
+.lm-logic { padding: var(--space-4); }
+.lm-logic small { font-size: var(--text-xs); }
+.lm-filters { padding: var(--space-4); gap: var(--space-4); }
+.lm-tracking-kpis { gap: var(--space-4); }
+.lm-tracking-kpis article, .lm-summary-kpis article { min-height: 104px; padding: var(--space-5); }
+.lm-tracking-kpis small, .lm-summary-kpis small, .lm-tracking-kpis em, .lm-summary-kpis em { font-size: var(--text-xs); }
+.lm-tracking-kpis strong, .lm-summary-kpis strong { font-size: 24px; }
+.lm-live-panel > button { min-height: 54px; padding: var(--space-3) var(--space-1); }
+.lm-live-panel > button span strong { font-size: 13px; }
+.lm-live-panel > button span small, .lm-live-panel > button em, .lm-performance small { font-size: var(--text-xs); }
+.lm-performance article { min-height: 72px; padding: var(--space-3) var(--space-4); }
+.lm-journey-meta { padding: var(--space-3); }
+.lm-journey-meta article { padding: var(--space-3) var(--space-4); }
+.lm-journey-meta small { font-size: var(--text-xs); }
+.lm-journey-meta strong { font-size: 14px; }
+.lm-sequence article { min-width: 175px; padding: 32px var(--space-3) var(--space-4); }
+.lm-sequence article small, .lm-sequence article span, .lm-sequence article em { font-size: var(--text-xs); }
+.lm-captured-log > div { grid-template-columns: 10px 80px 140px 1fr; min-height: 42px; gap: var(--space-2); font-size: var(--text-xs); }
+.lm-automation-create, .lm-automation-cards > section { padding: var(--space-5); }
+.lm-auto-grid { gap: var(--space-3) var(--space-4); margin-top: var(--space-4); }
+.lm-tags { min-height: 46px; padding: var(--space-2); gap: var(--space-1); }
+.lm-tags i, .lm-channel, .lm-share, .lm-message small, .lm-message strong, .lm-triggers > button { font-size: var(--text-xs); }
+.lm-channel { min-height: 38px; padding: 0 var(--space-2); }
+.lm-message { padding: var(--space-3); }
+.lm-triggers > button { min-height: 42px; padding: 0 var(--space-3); }
+
+@media (max-width: 1180px) {
+  .app-shell { grid-template-columns: 236px minmax(0,1fr); }
+}
+
+@media (max-width: 900px) {
+  .content { padding: var(--space-6) var(--space-5) 44px; }
+  .app-header { padding: 0 var(--space-5); }
+  .sidebar { width: 264px; left: -280px; }
+  .lm-page-head { align-items: flex-start; flex-direction: column; }
+  .lm-page-head > div:last-child { width: 100%; }
+  .lm-table-wrap { margin-inline: calc(var(--space-5) * -1); padding-inline: var(--space-5); }
+}
+
+@media (max-width: 820px) {
+  .camera-admin-grid, .monitor-grid.columns-2, .monitor-grid.columns-3 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  .content { padding: var(--space-5) var(--space-3) 40px; }
+  .app-header { height: 68px; padding: 0 var(--space-3); }
+  .lifecycle-workspace-nav { overflow-x: auto; }
+  .lifecycle-workspace-nav > span { display: none; }
+  .lifecycle-workspace-nav button { flex: 0 0 auto; }
+  .page-title h2, .section-heading h2, .lm-page-head h2 { font-size: 24px; }
+  .wizard-content { padding: var(--space-5); }
+  .wizard-footer { padding: var(--space-3) var(--space-4); }
+  .lm-plate-readings, .lm-config, .lm-mapping, .lm-entries, .lm-live-panel, .lm-performance, .lm-sequence, .lm-station-summary, .lm-captured-log, .lm-active-automations, .lm-triggers { padding: var(--space-4); }
+  .lm-table-wrap { margin-inline: calc(var(--space-4) * -1); padding-inline: var(--space-4); }
 }

@@ -28,10 +28,17 @@ The first setup needs an internet connection and several gigabytes of free disk 
 
 ## Install after cloning
 
-1. Clone or download this repository.
-2. Double-click **`Setup OptiVision.cmd`** once.
-3. Wait until the window says **Setup complete**.
-4. Double-click **`Start OptiVision UI.cmd`** whenever you want to use OptiVision.
+1. Clone the repository: `git clone https://github.com/VishalkumarPandey7/optivison-ui.git`.
+2. Open the cloned `optivison-ui` folder.
+3. Double-click **`Setup OptiVision.cmd`** once.
+4. Wait until the window says **Setup complete**.
+5. Double-click **`Start OptiVision UI.cmd`** whenever you want to use OptiVision.
+
+The repository can be placed in any writable folder. The scripts resolve all project paths from their own location; they do not depend on the original developer's username, OneDrive directory, or drive letter.
+
+If setup reports a missing prerequisite, install the named Node.js, Python, or Git requirement and run the same setup file again. It is safe to rerun: the external LPR checkout is pinned and existing compatibility changes are detected before modification.
+
+To verify the complete installation later, double-click **`Verify OptiVision.cmd`**. It builds the frontend, runs the worker tests, checks the AI packages, and loads both external LPR models.
 
 Setup creates `worker/.venv`, installs the pinned AI packages, downloads the standard detection/pose models, and clones the external Indian_LPR dependency at commit `43b6c37f1773741c7fae81681c4f4158d8be7c34`. It applies the OptiVision compatibility patch locally, verifies both LPR weights by loading the detector and OCR models, installs frontend packages, and builds the dashboard. The external checkout and downloaded/generated files are intentionally excluded from this repository.
 
@@ -83,6 +90,8 @@ npm run dev -- --host 127.0.0.1 --port 4180
 
 Open `http://127.0.0.1:4180`.
 
+The frontend uses `http://127.0.0.1:8770` by default. Developers can copy `.env.example` to `.env.local` and change `VITE_OPTIVISION_WORKER_URL` when the worker runs at another address.
+
 ## Configure and operate a camera
 
 1. Open **Cameras** and select or add a camera.
@@ -98,7 +107,7 @@ Uploaded videos play through their complete duration and then loop for repeat te
 
 ## Test the LPR lifecycle correctly
 
-1. Open **LPR Cycle → Station Mapping**.
+1. Open **Lifecycle Tracking**, use the three-line view menu, and select **Station Mapping**.
 2. Assign one mapped camera as the **Start Station** and one as the **End Station**. Intermediate mapped cameras represent processing stations.
 3. Use **Whole camera frame** or select a plate ROI for each station.
 4. Click **Save & Start Mapped Cameras**.
@@ -162,6 +171,8 @@ Important frontend files:
 - `src/App.tsx` — application shell, navigation, camera setup, monitoring, dashboard, signals/rules, training, notifications, and UI components.
 - `src/vision.tsx` — shared camera state, source connections, independent per-camera engine state, frame capture, worker API calls, detection overlays, metrics, and local persistence.
 - `src/lpr.tsx` — LPR process mapping, identity matching, automatic journey creation, station transitions, summaries, correction/deletion, and lifecycle persistence.
+- `src/services/workerApi.ts` — configurable worker URL, typed JSON requests, timeouts, cancellation, and normalized errors.
+- `src/state/persistence.ts` — safe browser-state reading, validation, and quota/error handling.
 - `src/templates.ts` — built-in signal and detection-rule templates.
 - `src/styles.css` — complete orange-and-white product styling and responsive layout.
 - `tools/start-optivision-ui.ps1` — zero-command Windows launcher.
@@ -185,6 +196,7 @@ Bundled backend files are in `worker/`:
 - Worker URL: `http://127.0.0.1:8770`.
 - Health/catalog endpoint: `GET /health`.
 - Frame analysis endpoint: `POST /analyze`.
+- Worker errors use a consistent `{ ok: false, code, error }` response.
 - Every camera owns its configuration and `running[cameraId]` state; never replace this with one global engine switch.
 - Only explicitly drawn ROIs are sent for analysis.
 - Uploaded video is allowed to finish before looping.
@@ -212,6 +224,7 @@ Bundled backend files are in `worker/`:
 ### Current limitations
 
 - Configuration and lifecycle persistence are browser-local, not database-backed.
+- A fresh clone receives the complete application and default demo configuration, but not another computer's uploaded videos, browser-local camera configuration, lifecycle history, SMTP credentials, or generated training runs.
 - Raw RTSP/ONVIF feeds require a browser-compatible gateway.
 - OCR accuracy depends on plate size, focus, angle, illumination, and LPR training coverage.
 - Multi-camera throughput depends on CPU/GPU capacity because inference for each camera is processed independently.

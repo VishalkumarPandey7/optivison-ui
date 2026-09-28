@@ -3,7 +3,13 @@ import unittest
 import numpy as np
 import supervision as sv
 
-from server import filter_detections_to_analysis_rois, requested_model_class_ids, supervision_zone_memberships
+from server import (
+    RequestValidationError,
+    filter_detections_to_analysis_rois,
+    list_field,
+    requested_model_class_ids,
+    supervision_zone_memberships,
+)
 
 
 class SupervisionPipelineTest(unittest.TestCase):
@@ -54,6 +60,13 @@ class SupervisionPipelineTest(unittest.TestCase):
         detections = [{"id": "outside", "zoneIds": []}]
 
         self.assertEqual(filter_detections_to_analysis_rois(detections, set()), [])
+
+    def test_list_fields_are_validated_before_analysis(self):
+        self.assertEqual(list_field({}, "zones"), [])
+        self.assertEqual(list_field({}, "modelIds", ["yolo11n"]), ["yolo11n"])
+        with self.assertRaises(RequestValidationError) as context:
+            list_field({"zones": "operator-zone"}, "zones")
+        self.assertEqual(context.exception.code, "INVALID_FIELD_TYPE")
 
 
 if __name__ == "__main__":

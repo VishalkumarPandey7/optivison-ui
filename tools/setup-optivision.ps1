@@ -24,6 +24,11 @@ Write-Host "Project: $projectRoot"
 
 $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npm) { Stop-Setup 'Node.js/npm is required. Install the current Node.js LTS release, then run setup again.' }
+$node = Get-Command node.exe -ErrorAction SilentlyContinue
+if (-not $node) { Stop-Setup 'Node.js is required. Install Node.js 20.19 or newer, then run setup again.' }
+try { $nodeVersion = [version](([string](& $node.Source --version)).Trim().TrimStart('v')) }
+catch { Stop-Setup 'The installed Node.js version could not be read.' }
+if ($nodeVersion -lt [version]'20.19.0') { Stop-Setup "Node.js 20.19 or newer is required. Installed version: $nodeVersion" }
 
 if (-not (Test-Path -LiteralPath $workerPython)) {
   Write-Host 'Creating the Python virtual environment...'
@@ -35,6 +40,10 @@ if (-not (Test-Path -LiteralPath $workerPython)) {
 }
 
 if (-not (Test-Path -LiteralPath $workerPython)) { Stop-Setup 'The Python virtual environment could not be created.' }
+$pythonVersion = [version](([string](& $workerPython -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')).Trim())
+if ($pythonVersion -lt [version]'3.11.0') {
+  Stop-Setup "Python 3.11 or newer is required. The existing worker environment uses $pythonVersion. Remove worker\.venv, install a newer Python, and run setup again."
+}
 
 Write-Host 'Installing pinned AI dependencies. The first installation can take several minutes...'
 Invoke-External $workerPython @('-m', 'pip', 'install', '--upgrade', 'pip') 'Python package installer upgrade failed.'
@@ -109,5 +118,8 @@ try {
 } finally {
   Pop-Location
 }
+
+Write-Host 'Running the worker verification tests...'
+Invoke-External $workerPython @('-m', 'unittest', 'discover', '-s', $workerRoot, '-p', 'test_*.py') 'One or more worker tests failed.'
 
 Write-Host "`nSetup complete. Double-click 'Start OptiVision UI.cmd'." -ForegroundColor Green

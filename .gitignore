@@ -10,3 +10,6 @@ worker/.ultralytics/
 worker/__pycache__/
 worker/**/*.pyc
 .opti-vision-runtime/
+.env
+.env.local
+.env.*.local

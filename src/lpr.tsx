@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowLeft, ArrowRight, BarChart3, Bell, CalendarDays, Car, Check, CircleDot, Clock3, Download, FileText, Image, List, Mail, MapPin, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, Radio, RefreshCw, Route, Search, Settings2, ScanLine, Timer, Trash2, Truck, UserRound, Users, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ArrowRight, BarChart3, Bell, CalendarDays, Car, Check, ChevronDown, CircleDot, Clock3, Download, FileText, Image, List, Mail, MapPin, Menu, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, Radio, RefreshCw, Route, Search, Settings2, ScanLine, Timer, Trash2, Truck, UserRound, Users, Zap } from 'lucide-react';
 import { useVision, type AnalysisFrame } from './vision';
+import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
 
 type StageType = 'entry' | 'station' | 'exit';
 type WorkerState = 'working' | 'idle' | 'absent';
@@ -93,6 +94,8 @@ export interface LprCandidate {
 
 const LprContext = createContext<LprContextValue | null>(null);
 const processStorageKey = 'optivision-lpr-processes-v2';
+const selectedProcessStorageKey = 'optivision-lpr-selected-process-v1';
+const workspaceSectionStorageKey = 'optivision-lpr-workspace-section-v1';
 // v4 starts clean because earlier versions could create multiple journeys when
 // the OCR text changed while the same physical plate remained in view.
 const journeyStorageKey = 'optivision-lpr-journeys-v5';
@@ -155,7 +158,7 @@ function plateIdentityMatches(leftPlate: string, rightPlate: string, leftFingerp
 }
 
 function stored<T>(key: string): T[] {
-  try { return JSON.parse(window.localStorage.getItem(key) ?? '[]') as T[]; } catch { return []; }
+  return readStoredJson<T[]>(key, [], isArray<T>);
 }
 
 function defaultProcess(cameraId: string, zoneIds: string[]): LprProcess {
@@ -276,12 +279,16 @@ export function LprProvider({ children }: { children: ReactNode }) {
   });
   const [journeys, setJourneys] = useState<LprJourney[]>(() => stored<LprJourney>(journeyStorageKey));
   const [plateCandidates, setPlateCandidates] = useState<LprCandidate[]>([]);
-  const [selectedProcessId, setSelectedProcessId] = useState(processes[0]?.id ?? '');
+  const [selectedProcessId, setSelectedProcessId] = useState(() => {
+    const storedId = readStoredString(selectedProcessStorageKey);
+    return processes.some((process) => process.id === storedId) ? storedId! : processes[0]?.id ?? '';
+  });
   const seenFrames = useRef<Record<string, number>>({});
   const candidateMap = useRef<Record<string, LprCandidate>>({});
 
-  useEffect(() => { window.localStorage.setItem(processStorageKey, JSON.stringify(processes)); }, [processes]);
-  useEffect(() => { window.localStorage.setItem(journeyStorageKey, JSON.stringify(journeys.slice(0, 500))); }, [journeys]);
+  useEffect(() => { writeStoredJson(processStorageKey, processes); }, [processes]);
+  useEffect(() => { writeStoredJson(journeyStorageKey, journeys.slice(0, 500)); }, [journeys]);
+  useEffect(() => { writeStoredString(selectedProcessStorageKey, selectedProcessId); }, [selectedProcessId]);
 
   useEffect(() => {
     Object.entries(vision.frames).forEach(([cameraId, frame]) => {
@@ -526,9 +533,9 @@ function LifecycleSummary({ process, journey, back }: { process: LprProcess; jou
 }
 
 function LifecycleAutomations({ process }: { process: LprProcess }) {
-  const [automations, setAutomations] = useState<LifecycleAutomation[]>(() => { try { return JSON.parse(localStorage.getItem(lifecycleAutomationKey) ?? 'null') ?? lifecycleAutomationDefaults; } catch { return lifecycleAutomationDefaults; } });
+  const [automations, setAutomations] = useState<LifecycleAutomation[]>(() => readStoredJson(lifecycleAutomationKey, lifecycleAutomationDefaults, isArray<LifecycleAutomation>));
   const [trigger, setTrigger] = useState('Vehicle reached station'); const [audience, setAudience] = useState('Customer'); const [channel, setChannel] = useState('WhatsApp');
-  useEffect(() => localStorage.setItem(lifecycleAutomationKey, JSON.stringify(automations)), [automations]);
+  useEffect(() => { writeStoredJson(lifecycleAutomationKey, automations); }, [automations]);
   const update = (id: string, value: Partial<LifecycleAutomation>) => setAutomations((items) => items.map((item) => item.id === id ? { ...item, ...value } : item));
   return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Automations</span><h2>Lifecycle Automations</h2><p>Send real-time updates to customers and admins based on captured station events.</p></div></div><section className="lm-card lm-automation-create"><label><span>Trigger Event *</span><select value={trigger} onChange={(event) => setTrigger(event.target.value)}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Worker idle too long</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span>Recipients *</span><select value={audience} onChange={(event) => setAudience(event.target.value)}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span>Channel *</span><select value={channel} onChange={(event) => setChannel(event.target.value)}><option>WhatsApp</option><option>Email</option></select></label><button className="lm-primary" onClick={() => setAutomations((items) => [...items, { id: `automation-${Date.now()}`, name: `${trigger} Update`, audience, trigger, channels: [channel], stations: [], shareImage: false, active: true }])} type="button"><Plus size={17} />Create Automation</button></section><div className="lm-automation-cards">{automations.slice(0, 2).map((item, index) => <section className="lm-card" key={item.id}><header><div className={index ? 'orange' : 'green'}><Users size={20} /></div><span><h3>{item.name}</h3><p>{index ? 'Notify admins when a vehicle leaves a station or on stage completion.' : 'Notify customers when their vehicle reaches a station.'}</p></span><button className={`lm-toggle ${item.active ? 'on' : ''}`} onClick={() => update(item.id, { active: !item.active })} type="button"><i /></button><MoreHorizontal size={17} /></header><div className="lm-auto-grid"><label><span><Zap size={14} />Trigger Event</span><select value={item.trigger} onChange={(event) => update(item.id, { trigger: event.target.value })}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span><UserRound size={14} />Recipients</span><select value={item.audience} onChange={(event) => update(item.id, { audience: event.target.value })}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span><List size={14} />Stations / Events</span><div className="lm-tags">{(item.stations.length ? item.stations : process.stages.slice(1, 5).map((stage) => stage.name)).map((name) => <i key={name}>{name}</i>)}</div></label><label><span>Channels</span><div className="lm-channel"><MessageCircle size={16} />WhatsApp<button className={`lm-toggle ${item.channels.includes('WhatsApp') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('WhatsApp') ? item.channels.filter((value) => value !== 'WhatsApp') : [...item.channels, 'WhatsApp'] })} type="button"><i /></button></div><div className="lm-channel"><Mail size={16} />Email<button className={`lm-toggle ${item.channels.includes('Email') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('Email') ? item.channels.filter((value) => value !== 'Email') : [...item.channels, 'Email'] })} type="button"><i /></button></div></label></div><label className="lm-share"><Image size={15} />Share station image<button className={`lm-toggle ${item.shareImage ? 'on' : ''}`} onClick={() => update(item.id, { shareImage: !item.shareImage })} type="button"><i /></button></label><div className="lm-message"><MessageCircle size={15} /><span><small>Message Preview</small><strong>{item.audience === 'Customer' ? 'Your vehicle MH12AB1234 has reached Inspection.' : 'Vehicle MH12AB1234 completed Inspection. Stage time: 48 min.'}</strong></span></div></section>)}</div><div className="lm-automation-bottom"><section className="lm-card lm-active-automations"><header><List size={18} /><div><h3>Active Automations</h3><p>Manage your configured automations for lifecycle notifications.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Automation Name</th><th>Audience</th><th>Channels</th><th>Share Image</th><th>Status</th><th>Actions</th></tr></thead><tbody>{automations.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.audience}</td><td>{item.channels.join(' · ')}</td><td>{item.shareImage ? 'Yes' : 'No'}</td><td><span className={`lm-status ${item.active ? 'green' : 'gray'}`}><i />{item.active ? 'Active' : 'Inactive'}</span></td><td><button type="button"><Pencil size={14} /></button><button type="button"><MoreHorizontal size={14} /></button></td></tr>)}</tbody></table></div></section><aside className="lm-card lm-triggers"><header><Settings2 size={18} /><div><h3>Available Triggers</h3><p>Events that can start an automation.</p></div></header>{['Vehicle Entered Start Station', 'Vehicle Reached Station', 'Worker Idle Too Long', 'Vehicle Delayed', 'Vehicle Exited End Station'].map((item) => <button type="button" key={item}><Zap size={14} />{item}<ArrowRight size={14} /></button>)}</aside></div></div>;
 }
@@ -540,21 +547,37 @@ function LifecyclePlateStatus({ process }: { process: LprProcess }) {
   return <section className="lm-card lm-plate-readings"><header><ScanLine size={18} /><div><h3>Live Plate Recognition</h3><p>The first valid detection is cropped, recognized and stored. Later readings, the saved image and station order keep the same vehicle linked across cameras.</p></div></header><div>{candidates.map((candidate) => { const stage = process.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>Captured and stored</strong><small>{stage?.name ?? 'Unmapped station'} · OCR {candidate.plate} · {candidate.observations} linked reading{candidate.observations === 1 ? '' : 's'}</small><i><b style={{ width: '100%' }} /></i></span></article>; })}</div></section>;
 }
 
-export function LprCyclePage() {
-  const lpr = useLpr();
-  const [section, setSection] = useState<'mapping' | 'automations'>('mapping');
-  const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
-  if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
-  return <div className="lifecycle-module"><div className="lm-navigation"><button className={section === 'mapping' ? 'active' : ''} onClick={() => setSection('mapping')} type="button"><MapPin size={15} />Station Mapping</button><button className={section === 'automations' ? 'active' : ''} onClick={() => setSection('automations')} type="button"><Zap size={15} />Automations</button></div>{section === 'mapping' ? <LifecycleMapping process={process} /> : <LifecycleAutomations process={process} />}</div>;
-}
+type LifecycleWorkspaceSection = 'tracking' | 'mapping' | 'automations';
 
-export function LprTrackingPage() {
+export function LprTrackingPage({ initialSection = 'tracking' }: { initialSection?: LifecycleWorkspaceSection }) {
   const lpr = useLpr();
+  const [section, setSection] = useState<LifecycleWorkspaceSection>(() => {
+    const storedSection = readStoredString(workspaceSectionStorageKey) as LifecycleWorkspaceSection;
+    return storedSection && ['tracking', 'mapping', 'automations'].includes(storedSection) ? storedSection : initialSection;
+  });
+  const [menuOpen, setMenuOpen] = useState(false);
   const [selectedJourneyId, setSelectedJourneyId] = useState('');
   const [showSummary, setShowSummary] = useState(false);
+  useEffect(() => { writeStoredString(workspaceSectionStorageKey, section); }, [section]);
   const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
   const journey = lpr.journeys.find((item) => item.id === selectedJourneyId) ?? lpr.journeys.find((item) => item.processId === process?.id);
   if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
   const openSummary = (item: LprJourney) => { setSelectedJourneyId(item.id); setShowSummary(true); };
-  return <div className="lifecycle-module"><LifecyclePlateStatus process={process} />{showSummary ? <LifecycleSummary process={process} journey={journey} back={() => setShowSummary(false)} /> : <LifecycleTracking process={process} openSummary={openSummary} />}</div>;
+  return <div className="lifecycle-module">
+    <div className="lifecycle-workspace-menu">
+      <button className="lifecycle-menu-trigger" aria-expanded={menuOpen} aria-haspopup="menu" onClick={() => setMenuOpen((open) => !open)} type="button">
+        <Menu size={19} />
+        <span>{section === 'tracking' ? 'Tracking' : section === 'mapping' ? 'Station Mapping' : 'Automations'}</span>
+        <ChevronDown className={menuOpen ? 'open' : ''} size={16} />
+      </button>
+      {menuOpen ? <div className="lifecycle-menu-popover" role="menu" aria-label="Lifecycle view">
+        <button className={section === 'tracking' ? 'active' : ''} onClick={() => { setSection('tracking'); setMenuOpen(false); }} role="menuitem" type="button"><Route size={16} /><span><strong>Tracking</strong><small>View vehicles and journey progress</small></span></button>
+        <button className={section === 'mapping' ? 'active' : ''} onClick={() => { setSection('mapping'); setMenuOpen(false); }} role="menuitem" type="button"><MapPin size={16} /><span><strong>Station Mapping</strong><small>Connect cameras to lifecycle stations</small></span></button>
+        <button className={section === 'automations' ? 'active' : ''} onClick={() => { setSection('automations'); setMenuOpen(false); }} role="menuitem" type="button"><Zap size={16} /><span><strong>Automations</strong><small>Configure lifecycle notifications</small></span></button>
+      </div> : null}
+    </div>
+    {section === 'tracking' ? <><LifecyclePlateStatus process={process} />{showSummary ? <LifecycleSummary process={process} journey={journey} back={() => setShowSummary(false)} /> : <LifecycleTracking process={process} openSummary={openSummary} />}</> : null}
+    {section === 'mapping' ? <LifecycleMapping process={process} /> : null}
+    {section === 'automations' ? <LifecycleAutomations process={process} /> : null}
+  </div>;
 }

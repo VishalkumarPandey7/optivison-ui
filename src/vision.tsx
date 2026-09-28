@@ -9,8 +9,10 @@ import {
   useState,
   type ReactNode
 } from 'react';
+import { requestJson, visionRuntimeConfig } from './services/workerApi';
+import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
 
-export const workerUrl = 'http://127.0.0.1:8770';
+export { workerUrl } from './services/workerApi';
 
 export type SourceType = 'browser' | 'uploaded' | 'usb' | 'http' | 'rtsp' | 'onvif' | 'nvr';
 export type SourceStatus = 'empty' | 'starting' | 'ready' | 'error';
@@ -357,21 +359,79 @@ function defaultCamera(index: number, useCase: CameraConfiguration['useCase'] = 
 }
 
 const storageKey = 'optivision-approved-ui-engine-v1';
+const activeCameraStorageKey = 'optivision-active-camera-v1';
+const eventsStorageKey = 'optivision-runtime-events-v1';
+const metricsStorageKey = 'optivision-session-metrics-v1';
+const mediaDatabaseName = 'optivision-media-v1';
+const mediaStoreName = 'camera-sources';
 const emptyMetrics: SessionMetrics = { activeSeconds: 0, idleSeconds: 0, absentSeconds: 0, uptimeSeconds: 0, downtimeSeconds: 0, lastTimestamp: null };
+
+interface StoredCameraMedia {
+  cameraId: string;
+  name: string;
+  type: string;
+  blob: Blob;
+}
+
+function openMediaDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(mediaDatabaseName, 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(mediaStoreName)) database.createObjectStore(mediaStoreName, { keyPath: 'cameraId' });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Could not open local video storage.'));
+  });
+}
+
+async function saveCameraMedia(cameraId: string, file: File) {
+  const database = await openMediaDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(mediaStoreName, 'readwrite');
+    transaction.objectStore(mediaStoreName).put({ cameraId, name: file.name, type: file.type, blob: file } satisfies StoredCameraMedia);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not save the uploaded video locally.'));
+  });
+  database.close();
+}
+
+async function loadCameraMedia(cameraId: string): Promise<StoredCameraMedia | null> {
+  const database = await openMediaDatabase();
+  const media = await new Promise<StoredCameraMedia | null>((resolve, reject) => {
+    const request = database.transaction(mediaStoreName, 'readonly').objectStore(mediaStoreName).get(cameraId);
+    request.onsuccess = () => resolve((request.result as StoredCameraMedia | undefined) ?? null);
+    request.onerror = () => reject(request.error ?? new Error('Could not restore the uploaded video.'));
+  });
+  database.close();
+  return media;
+}
+
+async function deleteCameraMedia(cameraId: string) {
+  const database = await openMediaDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(mediaStoreName, 'readwrite');
+    transaction.objectStore(mediaStoreName).delete(cameraId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not remove the saved video.'));
+  });
+  database.close();
+}
 
 function loadCameras(): CameraRecord[] {
   try {
-    const stored = window.localStorage.getItem(storageKey);
-    if (!stored) return [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
-    const parsed = JSON.parse(stored) as CameraRecord[];
+    const parsed = readStoredJson<CameraRecord[]>(storageKey, [], isArray<CameraRecord>);
+    if (!parsed.length) return [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
+    if (!Array.isArray(parsed) || !parsed.length) throw new Error('Invalid saved camera configuration.');
     return parsed.map((camera) => {
       const defaults = defaultConfiguration(camera.configuration?.useCase ?? 'worker');
       const savedZones = camera.configuration?.zones ?? [];
       const zones = [...savedZones, ...defaults.zones.filter((zone) => !savedZones.some((saved) => saved.id === zone.id))];
+      const restorableExternalSource = !['browser', 'usb', 'uploaded'].includes(camera.sourceType) && Boolean(camera.sourceUrl) && !camera.sourceUrl.startsWith('blob:');
       return {
         ...camera,
-        sourceStatus: 'empty' as const,
-        sourceUrl: '',
+        sourceStatus: restorableExternalSource ? 'ready' as const : 'empty' as const,
+        sourceUrl: restorableExternalSource ? camera.sourceUrl : '',
         error: '',
         configuration: {
           ...defaults,
@@ -435,41 +495,66 @@ function plateVisualEvidence(source: HTMLCanvasElement, box: [number, number, nu
   return { plateFingerprint: fingerprint, plateImage: imageCanvas.toDataURL('image/jpeg', .72) };
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${workerUrl}${path}`, init);
-  const payload = await response.json() as T & { ok?: boolean; error?: string };
-  if (!response.ok || payload.ok === false) throw new Error(payload.error || `Worker returned ${response.status}`);
-  return payload;
-}
-
 const VisionContext = createContext<VisionContextValue | null>(null);
+
+function PersistentRuntimeVideo({ camera, register }: { camera: CameraRecord; register: (cameraId: string, node: HTMLVideoElement | null) => void }) {
+  const setNode = useCallback((node: HTMLVideoElement | null) => register(camera.id, node), [camera.id, register]);
+  return <video autoPlay loop={camera.sourceType === 'uploaded'} muted playsInline preload="auto" ref={setNode} />;
+}
 
 export function VisionProvider({ children }: { children: ReactNode }) {
   const [workerStatus, setWorkerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [workerDetail, setWorkerDetail] = useState('Checking Ultralytics + Supervision worker');
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [cameras, setCameras] = useState<CameraRecord[]>(loadCameras);
-  const [activeCameraId, setActiveCameraId] = useState('camera-1');
+  const [activeCameraId, setActiveCameraId] = useState(() => {
+    const storedId = readStoredString(activeCameraStorageKey);
+    return cameras.some((camera) => camera.id === storedId) ? storedId! : cameras[0]?.id ?? 'camera-1';
+  });
   const [frames, setFrames] = useState<Record<string, AnalysisFrame>>({});
   const [running, setRunning] = useState<Record<string, boolean>>({});
-  const [events, setEvents] = useState<RuntimeEvent[]>([]);
-  const [metrics, setMetrics] = useState<Record<string, SessionMetrics>>({});
+  const [events, setEvents] = useState<RuntimeEvent[]>(() => readStoredJson<RuntimeEvent[]>(eventsStorageKey, []));
+  const [metrics, setMetrics] = useState<Record<string, SessionMetrics>>(() => {
+    const saved = readStoredJson<Record<string, SessionMetrics>>(metricsStorageKey, {});
+    return Object.fromEntries(Object.entries(saved).map(([cameraId, value]) => [cameraId, { ...emptyMetrics, ...value, lastTimestamp: null }]));
+  });
   const cameraRef = useRef(cameras);
+  // Runtime videos stay mounted inside VisionProvider and are the only source
+  // used for inference. Page-level videos are previews and may mount/unmount as
+  // the user navigates without interrupting analysis.
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  const previewVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const streamRefs = useRef<Record<string, MediaStream | null>>({});
   const uploadUrlRefs = useRef<Record<string, string>>({});
   const hlsRefs = useRef<Record<string, Hls | null>>({});
+  const previewHlsRefs = useRef<Record<string, Hls | null>>({});
   const canvasRefs = useRef<Record<string, HTMLCanvasElement>>({});
   const playbackTimes = useRef<Record<string, number>>({});
   const frameNumbers = useRef<Record<string, number>>({});
   const analyzing = useRef<Record<string, boolean>>({});
+  const activeAnalysisCount = useRef(0);
+  const lastAnalysisStarted = useRef<Record<string, number>>({});
   const lastOutputs = useRef<Record<string, string[]>>({});
 
   useEffect(() => { cameraRef.current = cameras; }, [cameras]);
   useEffect(() => {
-    const persistable = cameras.map((camera) => ({ ...camera, sourceStatus: 'empty', sourceUrl: '', sourceLabel: '', error: '' }));
-    window.localStorage.setItem(storageKey, JSON.stringify(persistable));
+    const persistable = cameras.map((camera) => {
+      const canRestoreUrl = !['browser', 'usb', 'uploaded'].includes(camera.sourceType) && Boolean(camera.sourceUrl) && !camera.sourceUrl.startsWith('blob:');
+      return {
+        ...camera,
+        sourceStatus: canRestoreUrl ? 'ready' as const : 'empty' as const,
+        sourceUrl: canRestoreUrl ? camera.sourceUrl : '',
+        error: ''
+      };
+    });
+    writeStoredJson(storageKey, persistable);
   }, [cameras]);
+  useEffect(() => { writeStoredString(activeCameraStorageKey, activeCameraId); }, [activeCameraId]);
+  useEffect(() => { writeStoredJson(eventsStorageKey, events.slice(0, 500)); }, [events]);
+  useEffect(() => {
+    const persistable = Object.fromEntries(Object.entries(metrics).map(([cameraId, value]) => [cameraId, { ...value, lastTimestamp: null }]));
+    writeStoredJson(metricsStorageKey, persistable);
+  }, [metrics]);
 
   const refreshModels = useCallback(async () => {
     try {
@@ -500,11 +585,44 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     }));
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    cameras.filter((camera) => camera.sourceType === 'uploaded' && camera.sourceLabel).forEach((camera) => {
+      void loadCameraMedia(camera.id).then((media) => {
+        if (!media || cancelled) return;
+        const url = URL.createObjectURL(media.blob);
+        if (cancelled) { URL.revokeObjectURL(url); return; }
+        if (uploadUrlRefs.current[camera.id]) URL.revokeObjectURL(uploadUrlRefs.current[camera.id]);
+        uploadUrlRefs.current[camera.id] = url;
+        updateCamera(camera.id, { sourceStatus: 'ready', sourceUrl: url, sourceLabel: media.name, error: '' });
+        const node = videoRefs.current[camera.id];
+        if (node) {
+          node.src = url;
+          node.loop = true;
+          void node.play().catch(() => undefined);
+        }
+        const preview = previewVideoRefs.current[camera.id];
+        if (preview) {
+          preview.src = url;
+          preview.loop = true;
+          void preview.play().catch(() => undefined);
+        }
+      }).catch((error) => {
+        if (!cancelled) updateCamera(camera.id, { sourceStatus: 'error', error: error instanceof Error ? error.message : 'Could not restore the uploaded video.' });
+      });
+    });
+    return () => { cancelled = true; };
+  // Uploaded media is restored once from IndexedDB; later camera changes are handled by the connect methods.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const stopSource = useCallback((cameraId: string) => {
     streamRefs.current[cameraId]?.getTracks().forEach((track) => track.stop());
     streamRefs.current[cameraId] = null;
     hlsRefs.current[cameraId]?.destroy();
     hlsRefs.current[cameraId] = null;
+    previewHlsRefs.current[cameraId]?.destroy();
+    previewHlsRefs.current[cameraId] = null;
     if (uploadUrlRefs.current[cameraId]) URL.revokeObjectURL(uploadUrlRefs.current[cameraId]);
     uploadUrlRefs.current[cameraId] = '';
     playbackTimes.current[cameraId] = 0;
@@ -515,9 +633,16 @@ export function VisionProvider({ children }: { children: ReactNode }) {
       video.removeAttribute('src');
       video.load();
     }
+    const preview = previewVideoRefs.current[cameraId];
+    if (preview) {
+      preview.pause();
+      preview.srcObject = null;
+      preview.removeAttribute('src');
+      preview.load();
+    }
   }, []);
 
-  const attachSource = useCallback((camera: CameraRecord, node: HTMLVideoElement) => {
+  const attachSource = useCallback((camera: CameraRecord, node: HTMLVideoElement, preview = false) => {
     const stream = streamRefs.current[camera.id];
     if (stream) {
       if (node.srcObject !== stream) node.srcObject = stream;
@@ -526,10 +651,11 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     }
     if (!camera.sourceUrl) return;
     if (camera.sourceUrl.toLowerCase().includes('.m3u8') && Hls.isSupported()) {
-      if (hlsRefs.current[camera.id]) return;
-      hlsRefs.current[camera.id]?.destroy();
+      const refs = preview ? previewHlsRefs : hlsRefs;
+      if (refs.current[camera.id]) return;
+      refs.current[camera.id]?.destroy();
       const hls = new Hls({ lowLatencyMode: true });
-      hlsRefs.current[camera.id] = hls;
+      refs.current[camera.id] = hls;
       hls.loadSource(camera.sourceUrl);
       hls.attachMedia(node);
       hls.on(Hls.Events.MANIFEST_PARSED, () => void node.play().catch(() => undefined));
@@ -540,27 +666,45 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setVideoElement = useCallback((cameraId: string, node: HTMLVideoElement | null) => {
-    if (videoRefs.current[cameraId] === node) return;
-    const previousNode = videoRefs.current[cameraId];
-    if (previousNode && Number.isFinite(previousNode.currentTime) && previousNode.currentTime > 0) playbackTimes.current[cameraId] = previousNode.currentTime;
-    videoRefs.current[cameraId] = node;
-    if (!node) return;
+    if (previewVideoRefs.current[cameraId] === node) return;
+    if (!node) {
+      previewHlsRefs.current[cameraId]?.destroy();
+      previewHlsRefs.current[cameraId] = null;
+      previewVideoRefs.current[cameraId] = null;
+      return;
+    }
+    previewVideoRefs.current[cameraId] = node;
     const camera = cameraRef.current.find((item) => item.id === cameraId);
     if (camera) {
-      attachSource(camera, node);
-      const resumeAt = playbackTimes.current[cameraId] ?? 0;
+      attachSource(camera, node, true);
+      const runtime = videoRefs.current[cameraId];
+      const resumeAt = runtime && Number.isFinite(runtime.currentTime) ? runtime.currentTime : playbackTimes.current[cameraId] ?? 0;
       if (camera.sourceType === 'uploaded' && resumeAt > 0) {
         const restore = () => {
           if (Number.isFinite(node.duration) && resumeAt < node.duration - 0.25) node.currentTime = resumeAt;
         };
         if (node.readyState >= 1) restore(); else node.addEventListener('loadedmetadata', restore, { once: true });
       }
-      node.addEventListener('timeupdate', () => { playbackTimes.current[cameraId] = node.currentTime; });
+      node.addEventListener('seeked', () => {
+        const activeRuntime = videoRefs.current[cameraId];
+        if (camera.sourceType === 'uploaded' && activeRuntime && Math.abs(activeRuntime.currentTime - node.currentTime) > 0.75) activeRuntime.currentTime = node.currentTime;
+      });
     }
+  }, [attachSource]);
+
+  const setRuntimeVideoElement = useCallback((cameraId: string, node: HTMLVideoElement | null) => {
+    if (videoRefs.current[cameraId] === node) return;
+    videoRefs.current[cameraId] = node;
+    if (!node) return;
+    const camera = cameraRef.current.find((item) => item.id === cameraId);
+    if (!camera) return;
+    attachSource(camera, node);
+    node.addEventListener('timeupdate', () => { playbackTimes.current[cameraId] = node.currentTime; });
   }, [attachSource]);
 
   const connectBrowserCamera = useCallback(async (cameraId: string, deviceId?: string) => {
     stopSource(cameraId);
+    void deleteCameraMedia(cameraId).catch(() => undefined);
     updateCamera(cameraId, { sourceType: deviceId ? 'usb' : 'browser', sourceStatus: 'starting', error: '' });
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access is not available in this browser.');
@@ -568,6 +712,8 @@ export function VisionProvider({ children }: { children: ReactNode }) {
       streamRefs.current[cameraId] = stream;
       const node = videoRefs.current[cameraId];
       if (node) { node.srcObject = stream; await node.play(); }
+      const preview = previewVideoRefs.current[cameraId];
+      if (preview) { preview.srcObject = stream; await preview.play().catch(() => undefined); }
       const label = stream.getVideoTracks()[0]?.label || (deviceId ? 'USB Camera' : 'Browser Camera');
       updateCamera(cameraId, { sourceStatus: 'ready', sourceLabel: label, sourceUrl: '', error: '' });
     } catch (error) {
@@ -579,26 +725,38 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   const connectUploadedVideo = useCallback(async (cameraId: string, file: File) => {
     stopSource(cameraId);
     playbackTimes.current[cameraId] = 0;
+    try {
+      await saveCameraMedia(cameraId, file);
+    } catch (error) {
+      updateCamera(cameraId, { sourceType: 'uploaded', sourceStatus: 'error', sourceUrl: '', sourceLabel: file.name, error: error instanceof Error ? error.message : 'Could not save this video for refresh recovery.' });
+      throw error;
+    }
     const url = URL.createObjectURL(file);
     uploadUrlRefs.current[cameraId] = url;
     updateCamera(cameraId, { sourceType: 'uploaded', sourceStatus: 'ready', sourceUrl: url, sourceLabel: file.name, error: '' });
     const node = videoRefs.current[cameraId];
     if (node) { node.src = url; node.loop = true; await node.play().catch(() => undefined); }
+    const preview = previewVideoRefs.current[cameraId];
+    if (preview) { preview.src = url; preview.loop = true; await preview.play().catch(() => undefined); }
   }, [stopSource, updateCamera]);
 
   const connectExternalVideo = useCallback(async (cameraId: string, url: string, sourceType: SourceType) => {
     if (!url.trim()) throw new Error('Enter a browser-playable stream URL.');
     if (url.trim().toLowerCase().startsWith('rtsp://')) throw new Error('Browsers cannot play raw RTSP. Enter an HLS, WebRTC, or HTTP bridge URL from the camera gateway or NVR.');
     stopSource(cameraId);
+    void deleteCameraMedia(cameraId).catch(() => undefined);
     const sourceUrl = url.trim();
     updateCamera(cameraId, { sourceType, sourceStatus: 'ready', sourceUrl, sourceLabel: `${sourceType.toUpperCase()} stream`, error: '' });
     const node = videoRefs.current[cameraId];
+    const preview = previewVideoRefs.current[cameraId];
     const camera = cameraRef.current.find((item) => item.id === cameraId);
     if (node && camera) attachSource({ ...camera, sourceType, sourceStatus: 'ready', sourceUrl }, node);
+    if (preview && camera) attachSource({ ...camera, sourceType, sourceStatus: 'ready', sourceUrl }, preview, true);
   }, [attachSource, stopSource, updateCamera]);
 
   const disconnectCamera = useCallback((cameraId: string) => {
     stopSource(cameraId);
+    void deleteCameraMedia(cameraId).catch(() => undefined);
     setRunning((current) => ({ ...current, [cameraId]: false }));
     setFrames((current) => { const next = { ...current }; delete next[cameraId]; return next; });
     updateCamera(cameraId, { sourceStatus: 'empty', sourceUrl: '', sourceLabel: '', error: '' });
@@ -615,6 +773,9 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     if (camera.sourceStatus !== 'ready') throw new Error('Connect the camera or video first.');
     const drawnZones = camera.configuration.zones.filter(isZoneDrawn);
     if (!drawnZones.length) throw new Error('Draw and activate at least one ROI before starting this camera.');
+    const runtimeVideo = videoRefs.current[cameraId];
+    if (!runtimeVideo) throw new Error('The persistent camera runtime is not ready yet.');
+    await runtimeVideo.play().catch(() => undefined);
     setRunning((current) => ({ ...current, [cameraId]: true }));
   }, [running, workerStatus]);
 
@@ -640,6 +801,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   const removeCamera = useCallback((cameraId: string) => {
     if (cameraRef.current.length <= 1) return;
     stopSource(cameraId);
+    void deleteCameraMedia(cameraId).catch(() => undefined);
     setCameras((current) => current.filter((camera) => camera.id !== cameraId));
     setRunning((current) => { const next = { ...current }; delete next[cameraId]; return next; });
     setFrames((current) => { const next = { ...current }; delete next[cameraId]; return next; });
@@ -648,11 +810,19 @@ export function VisionProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      cameraRef.current.filter((camera) => running[camera.id]).forEach((camera) => {
-        if (analyzing.current[camera.id]) return;
-        const video = videoRefs.current[camera.id];
-        if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+      const availableSlots = Math.max(0, visionRuntimeConfig.maxConcurrentAnalyses - activeAnalysisCount.current);
+      cameraRef.current
+        .filter((camera) => {
+          const video = videoRefs.current[camera.id];
+          return Boolean(running[camera.id] && !analyzing.current[camera.id] && video && video.readyState >= 2 && video.videoWidth && video.videoHeight);
+        })
+        .sort((left, right) => (lastAnalysisStarted.current[left.id] ?? 0) - (lastAnalysisStarted.current[right.id] ?? 0))
+        .slice(0, availableSlots)
+        .forEach((camera) => {
+        const video = videoRefs.current[camera.id]!;
         analyzing.current[camera.id] = true;
+        activeAnalysisCount.current += 1;
+        lastAnalysisStarted.current[camera.id] = performance.now();
         void (async () => {
           try {
             const maxWidth = 960;
@@ -723,10 +893,11 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             setEvents((current) => [{ id: `${camera.id}-error-${Date.now()}`, cameraId: camera.id, timestamp: Date.now() / 1000, type: 'error' as const, title: 'Analysis error', detail: message }, ...current].slice(0, 500));
           } finally {
             analyzing.current[camera.id] = false;
+            activeAnalysisCount.current = Math.max(0, activeAnalysisCount.current - 1);
           }
         })();
       });
-    }, 500);
+    }, visionRuntimeConfig.analysisIntervalMs);
     return () => window.clearInterval(timer);
   }, [running, updateCamera]);
 
@@ -743,7 +914,12 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     toggleEngine, resetCamera, refreshModels
   }), [workerStatus, workerDetail, models, cameras, activeCameraId, frames, running, events, metrics, getCamera, updateCamera, updateConfiguration, addCamera, removeCamera, setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera, toggleEngine, resetCamera, refreshModels]);
 
-  return <VisionContext.Provider value={value}>{children}</VisionContext.Provider>;
+  return <VisionContext.Provider value={value}>
+    <div className="vision-runtime-layer" aria-hidden="true">
+      {cameras.map((camera) => <PersistentRuntimeVideo camera={camera} key={camera.id} register={setRuntimeVideoElement} />)}
+    </div>
+    {children}
+  </VisionContext.Provider>;
 }
 
 export function useVision() {
@@ -752,39 +928,5 @@ export function useVision() {
   return context;
 }
 
-export interface TrainingAnnotation { id: string; className: string; x: number; y: number; width: number; height: number }
-export interface TrainingImage { id: string; fileName: string; width: number; height: number; reviewed: boolean; annotations: TrainingAnnotation[] }
-export interface TrainingVersion { id: string; createdAt: number; active: boolean; metrics: Record<string, number> }
-export interface TrainingProject {
-  id: string;
-  name: string;
-  description: string;
-  classes: string[];
-  baseModel: string;
-  status: string;
-  images: TrainingImage[];
-  versions: TrainingVersion[];
-  activeModelId: string | null;
-  training: null | { status: string; progress: number; epoch: number; totalEpochs: number; error?: string };
-}
-export interface TrainingState { ok: boolean; projects: TrainingProject[]; activatedModel?: { id: string; name: string; classes: string[] }; deletedModelIds?: string[] }
-
-export const trainingApi = {
-  list: () => requestJson<TrainingState>('/training/projects'),
-  create: (input: { name: string; description: string; classes: string[]; baseModel: string }) => requestJson<TrainingState>('/training/projects/create', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
-  upload: (projectId: string, images: Array<{ fileName: string; data: string }>) => requestJson<TrainingState>('/training/images/upload', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId, images }) }),
-  saveAnnotations: (projectId: string, imageId: string, annotations: TrainingAnnotation[], reviewed: boolean) => requestJson<TrainingState>('/training/annotations/save', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId, imageId, annotations, reviewed }) }),
-  train: (projectId: string, epochs: number, imageSize: number) => requestJson<TrainingState>('/training/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId, epochs, imageSize }) }),
-  activate: (projectId: string, versionId: string) => requestJson<TrainingState>('/training/activate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId, versionId }) }),
-  delete: (projectId: string) => requestJson<TrainingState>('/training/projects/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId }) }),
-  imageUrl: (projectId: string, imageId: string) => `${workerUrl}/training/image?projectId=${encodeURIComponent(projectId)}&imageId=${encodeURIComponent(imageId)}`
-};
-
-export function fileToDataUrl(file: File) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error ?? new Error('File could not be read.'));
-    reader.readAsDataURL(file);
-  });
-}
+export { fileToDataUrl, trainingApi } from './services/trainingApi';
+export type { TrainingAnnotation, TrainingImage, TrainingProject, TrainingState, TrainingVersion } from './services/trainingApi';

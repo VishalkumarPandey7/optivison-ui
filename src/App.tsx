@@ -66,7 +66,8 @@ import {
   type Zone
 } from './vision';
 import { builtInRuleTemplates, builtInSignalTemplates, createSignalFromTemplate, type RuleTemplate, type SignalTemplate } from './templates';
-import { LprCyclePage, LprTrackingPage } from './lpr';
+import { LprTrackingPage, useLpr } from './lpr';
+import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
 
 type Page =
   | 'setup-home'
@@ -85,6 +86,25 @@ type Page =
   | 'lpr-cycle'
   | 'lpr-tracking';
 
+const pageStorageKey = 'optivision-current-page-v1';
+const dashboardWidgetsStorageKey = 'optivision-dashboard-widgets-v1';
+const validPages = new Set<Page>([
+  'setup-home', 'add-camera', 'cameras', 'signals', 'detection-rules', 'business-rules',
+  'automations', 'integrations', 'training', 'monitoring', 'camera-detail', 'dashboard',
+  'notifications', 'lpr-cycle', 'lpr-tracking'
+]);
+
+function loadStoredPage(): Page {
+  const stored = readStoredString(pageStorageKey) as Page;
+  return stored && validPages.has(stored) ? stored : 'monitoring';
+}
+
+function loadDashboardWidgets() {
+  const fallback = ['Worker Productivity', 'Machine Utilization', 'Output Count', 'Camera Feed', 'Production Trend', 'Recent Alerts'];
+  const parsed = readStoredJson<string[]>(dashboardWidgetsStorageKey, fallback, isArray<string>);
+  return parsed.length ? parsed : fallback;
+}
+
 const setupNavigation: Array<{ id: Page; label: string; icon: typeof Camera }> = [
   { id: 'setup-home', label: 'Setup overview', icon: Layers3 },
   { id: 'cameras', label: 'Cameras', icon: Camera },
@@ -95,6 +115,24 @@ const setupNavigation: Array<{ id: Page; label: string; icon: typeof Camera }> =
   { id: 'integrations', label: 'Integrations', icon: Link2 },
   { id: 'training', label: 'Model training', icon: Cpu }
 ];
+
+const workflowSteps: Array<{ id: Page; label: string; hint: string; icon: typeof Camera }> = [
+  { id: 'cameras', label: 'Cameras', hint: 'Connect and define ROI', icon: Camera },
+  { id: 'signals', label: 'Signals', hint: 'Describe what is detected', icon: Activity },
+  { id: 'detection-rules', label: 'Detection Rules', hint: 'Combine signal states', icon: Waypoints },
+  { id: 'business-rules', label: 'Business Rules', hint: 'Calculate operational value', icon: BarChart3 },
+  { id: 'lpr-cycle', label: 'Lifecycle Setup', hint: 'Map LPR stations and flow', icon: ScanLine },
+  { id: 'automations', label: 'Automations', hint: 'Choose the response', icon: Zap },
+  { id: 'monitoring', label: 'Monitoring', hint: 'Run and observe', icon: MonitorPlay }
+];
+
+const workflowPages = new Set<Page>(['add-camera', ...workflowSteps.map((step) => step.id)]);
+
+function WorkflowGuide({ page, setPage }: { page: Page; setPage: (page: Page) => void }) {
+  const currentPage = page === 'add-camera' ? 'cameras' : page;
+  const currentIndex = workflowSteps.findIndex((step) => step.id === currentPage);
+  return <nav className="setup-workflow" aria-label="OptiVision setup workflow"><div className="workflow-context"><span>Configuration flow</span><strong>{currentIndex >= 0 ? `Step ${currentIndex + 1} of ${workflowSteps.length}` : 'Guided setup'}</strong></div><div className="workflow-track">{workflowSteps.map((step, index) => <button className={index === currentIndex ? 'active' : index < currentIndex ? 'visited' : ''} key={step.id} type="button" onClick={() => setPage(step.id)} title={step.hint}><span><step.icon size={15} /></span><small>{step.label}</small>{index < workflowSteps.length - 1 ? <ChevronRight size={13} /> : null}</button>)}</div></nav>;
+}
 
 const wizardSteps = [
   'Camera Source',
@@ -240,7 +278,7 @@ function EmptyFeed({
 
 function AppHeader({ page, setPage, sidebarOpen, setSidebarOpen }: { page: Page; setPage: (page: Page) => void; sidebarOpen: boolean; setSidebarOpen: (open: boolean) => void }) {
   const vision = useVision();
-  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'lpr-cycle' ? 'LPR Cycle' : page === 'lpr-tracking' ? 'Lifecycle Tracking' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'lpr-cycle' || page === 'lpr-tracking' ? 'Lifecycle Tracking' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   return (
     <header className="app-header">
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen(!sidebarOpen)}><Menu size={20} /></button>
@@ -264,8 +302,7 @@ function Sidebar({ page, setPage, open }: { page: Page; setPage: (page: Page) =>
         <span className="nav-label">OPERATIONS</span>
         <button className={page === 'monitoring' || page === 'camera-detail' ? 'active' : ''} type="button" onClick={() => setPage('monitoring')}><MonitorPlay size={18} />User monitoring</button>
         <button className={page === 'dashboard' ? 'active' : ''} type="button" onClick={() => setPage('dashboard')}><Grid2X2 size={18} />Dashboard</button>
-        <button className={page === 'lpr-cycle' ? 'active' : ''} type="button" onClick={() => setPage('lpr-cycle')}><ScanLine size={18} />LPR Cycle</button>
-        <button className={page === 'lpr-tracking' ? 'active' : ''} type="button" onClick={() => setPage('lpr-tracking')}><Route size={18} />Lifecycle Tracking</button>
+        <button className={page === 'lpr-tracking' || page === 'lpr-cycle' ? 'active' : ''} type="button" onClick={() => setPage('lpr-tracking')}><Route size={18} />Lifecycle Tracking</button>
         <button className={page === 'notifications' ? 'active' : ''} type="button" onClick={() => setPage('notifications')}><Bell size={18} />Notifications {vision.events.length ? <em>{Math.min(99, vision.events.length)}</em> : null}</button>
         <span className="nav-label setup-label">SETUP</span>
         {setupNavigation.map((item) => {
@@ -279,14 +316,6 @@ function Sidebar({ page, setPage, open }: { page: Page; setPage: (page: Page) =>
 }
 
 function SetupHome({ setPage }: { setPage: (page: Page) => void }) {
-  const hierarchy = [
-    ['Camera', 'Source and feed', Camera],
-    ['Model', 'Vision processing', Cpu],
-    ['Detection Signal', 'What vision sees', Activity],
-    ['Detection Rule', 'What detection means', Waypoints],
-    ['Business Rule', 'What it means for the factory', BarChart3],
-    ['Automation', 'What OptiVision should do', Zap]
-  ] as const;
   return (
     <div className="page-stack">
       <section className="hero-card">
@@ -296,7 +325,7 @@ function SetupHome({ setPage }: { setPage: (page: Page) => void }) {
       <section className="panel">
         <div className="section-heading"><div><span className="eyebrow">FINAL ARCHITECTURE</span><h2>Configuration hierarchy</h2><p>Each layer uses the output of the previous layer.</p></div></div>
         <div className="hierarchy-flow">
-          {hierarchy.map(([title, description, Icon], index) => <div className="hierarchy-item" key={title}><article><span><Icon size={19} /></span><div><strong>{title}</strong><small>{description}</small></div></article>{index < hierarchy.length - 1 && <ChevronRight size={18} />}</div>)}
+          {workflowSteps.map((step, index) => <div className="hierarchy-item" key={step.id}><button type="button" onClick={() => setPage(step.id)}><span><step.icon size={19} /></span><div><strong>{step.label}</strong><small>{step.hint}</small></div></button>{index < workflowSteps.length - 1 && <ChevronRight size={18} />}</div>)}
         </div>
       </section>
       <section className="two-column">
@@ -338,7 +367,11 @@ function CameraWizard({ setPage }: { setPage: (page: Page) => void }) {
   const vision = useVision();
   const camera = vision.getCamera();
   const config = camera.configuration;
-  const [step, setStep] = useState(0);
+  const wizardStepStorageKey = `optivision-camera-wizard-step:${camera.id}`;
+  const [step, setStep] = useState(() => {
+    const stored = Number(readStoredString(wizardStepStorageKey));
+    return Number.isInteger(stored) && stored >= 0 && stored < wizardSteps.length ? stored : 0;
+  });
   const [source, setSource] = useState(camera.sourceType);
   const [externalUrl, setExternalUrl] = useState(camera.sourceUrl);
   const [busy, setBusy] = useState('');
@@ -351,6 +384,10 @@ function CameraWizard({ setPage }: { setPage: (page: Page) => void }) {
   const [signalMode, setSignalMode] = useState<'existing' | 'new'>('existing');
   const [newSignal, setNewSignal] = useState({ name: 'Worker Working', className: 'person', kind: 'object_in_roi' as SignalKind, zoneId: 'operator-zone', holdSeconds: 5 });
   const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    writeStoredString(wizardStepStorageKey, String(step));
+  }, [step, wizardStepStorageKey]);
 
   const sourceChoices: Array<{ id: CameraRecord['sourceType']; label: string }> = [
     { id: 'rtsp', label: 'RTSP' }, { id: 'http', label: 'IP Camera' }, { id: 'onvif', label: 'ONVIF' },
@@ -615,7 +652,7 @@ const savedSignalTemplateKey = 'optivision-user-signal-templates-v1';
 const savedRuleTemplateKey = 'optivision-user-rule-templates-v1';
 
 function readSavedTemplates<T>(key: string): T[] {
-  try { return JSON.parse(window.localStorage.getItem(key) ?? '[]') as T[]; } catch { return []; }
+  return readStoredJson<T[]>(key, [], isArray<T>);
 }
 
 function uniqueDefinitionId(base: string, used: Set<string>) {
@@ -726,13 +763,13 @@ function DefinitionsPageV2({ type }: { type: 'signals' | 'detection-rules' | 'bu
     const zoneKind = config.zones.find((zone) => zone.id === signal.zoneId)?.kind;
     const { id: _id, zoneId: _zoneId, ...definition } = signal;
     const template: SignalTemplate = { id: `saved-signal-${Date.now()}`, name: signal.name, category: 'General', description: `Saved from ${camera.name}.`, definition: { ...definition, zoneKind } };
-    const next = [...savedSignals, template]; setSavedSignals(next); window.localStorage.setItem(savedSignalTemplateKey, JSON.stringify(next)); setNotice(`${signal.name} saved as a reusable template.`);
+    const next = [...savedSignals, template]; setSavedSignals(next); writeStoredJson(savedSignalTemplateKey, next); setNotice(`${signal.name} saved as a reusable template.`);
   }
 
   function saveRuleAsTemplate(rule: RuleDefinition) {
     const signals = rule.conditions.map((condition) => config.signals.find((signal) => signal.id === condition.signalId)).filter((signal): signal is SignalDefinition => Boolean(signal));
     const template: SavedRuleTemplate = { id: `saved-rule-${Date.now()}`, name: rule.name, description: `Saved from ${camera.name}.`, rule: { ...rule, id: `saved-${rule.id}` }, signals };
-    const next = [...savedRules, template]; setSavedRules(next); window.localStorage.setItem(savedRuleTemplateKey, JSON.stringify(next)); setNotice(`${rule.name} saved as a reusable template.`);
+    const next = [...savedRules, template]; setSavedRules(next); writeStoredJson(savedRuleTemplateKey, next); setNotice(`${rule.name} saved as a reusable template.`);
   }
 
   const visibleSignals = [...builtInSignalTemplates, ...savedSignals].filter((template) => `${template.name} ${template.category} ${template.description}`.toLowerCase().includes(search.toLowerCase()));
@@ -751,9 +788,34 @@ function DefinitionsPageV2({ type }: { type: 'signals' | 'detection-rules' | 'bu
   </div>;
 }
 
+type AutomationRecord = { id: string; name: string; trigger: string; actions: string[]; recipient: string; active: boolean };
+const automationStorageKey = 'optivision-automations-v1';
+const defaultAutomations: AutomationRecord[] = [
+  { id: 'machine-stopped-response', name: 'Machine stopped response', trigger: 'Machine Stopped = TRUE for 5 minutes', actions: ['WhatsApp', 'Email'], recipient: 'Maintenance Team', active: true },
+  { id: 'low-productivity-alert', name: 'Low productivity alert', trigger: 'Worker Productivity < 70%', actions: ['Email', 'In-system'], recipient: 'Production Manager', active: true },
+  { id: 'extended-worker-idle', name: 'Extended worker idle', trigger: 'Worker Idle > 10 minutes', actions: ['WhatsApp'], recipient: 'Production Manager', active: true }
+];
+
+function loadAutomations(): AutomationRecord[] {
+  return readStoredJson<AutomationRecord[]>(automationStorageKey, defaultAutomations, isArray<AutomationRecord>);
+}
+
 function AutomationsPage() {
   const [open, setOpen] = useState(false);
-  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">SETUP / AUTOMATIONS</span><h2>Automations</h2><p>What should OptiVision do when something happens?</p></div><button className="primary" type="button" onClick={() => setOpen(!open)}><Plus size={16} /> Create automation</button></div>{open && <section className="panel automation-editor"><div className="section-heading"><div><h3>Create automation</h3><p>Configure trigger, action, and recipients.</p></div><button className="icon-button" type="button" onClick={() => setOpen(false)}><X size={17} /></button></div><div className="automation-flow"><div><span>1</span><strong>Trigger</strong><select><option>Detection Rule</option><option>Business Rule</option><option>Threshold</option><option>Duration</option></select><select><option>Machine Stopped = TRUE</option><option>Worker Productivity &lt; 70%</option><option>Production Count &lt; 500</option><option>Worker Idle &gt; 10 minutes</option></select></div><ArrowRight size={20} /><div><span>2</span><strong>Actions</strong><label><input type="checkbox" defaultChecked /> Email</label><label><input type="checkbox" defaultChecked /> WhatsApp</label><label><input type="checkbox" defaultChecked /> In-system notification</label></div><ArrowRight size={20} /><div><span>3</span><strong>Recipients</strong><select><option>Production Manager</option><option>Maintenance Team</option></select><button className="add-inline" type="button"><Plus size={13} /> Add group</button></div></div><button className="primary" type="button"><Save size={15} /> Save automation</button></section>}<section className="automation-list">{[['Machine stopped response', 'Machine Stopped = TRUE for 5 minutes', 'WhatsApp + Email', 'Maintenance Team'], ['Low productivity alert', 'Worker Productivity < 70%', 'Email + In-system', 'Production Manager'], ['Extended worker idle', 'Worker Idle > 10 minutes', 'WhatsApp', 'Production Manager']].map(([name, trigger, action, recipient]) => <article className="panel" key={name}><div className="automation-icon"><Zap size={19} /></div><div><strong>{name}</strong><small>IF</small><p>{trigger}</p></div><ArrowRight size={18} /><div><small>THEN</small><p>{action}</p><span>{recipient}</span></div><Pill tone="green">Active</Pill><TableActions /></article>)}</section></div>;
+  const [automations, setAutomations] = useState<AutomationRecord[]>(loadAutomations);
+  const [trigger, setTrigger] = useState('Machine Stopped = TRUE for 5 minutes');
+  const [recipient, setRecipient] = useState('Maintenance Team');
+  const [actions, setActions] = useState<string[]>(['Email', 'WhatsApp', 'In-system']);
+  const [notice, setNotice] = useState('');
+  useEffect(() => { writeStoredJson(automationStorageKey, automations); }, [automations]);
+  function toggleAction(action: string) { setActions((current) => current.includes(action) ? current.filter((item) => item !== action) : [...current, action]); }
+  function saveAutomation() {
+    const name = trigger.split(/[=<]/)[0].trim().replace(/\b\w/g, (letter) => letter.toUpperCase());
+    setAutomations((current) => [...current, { id: `automation-${Date.now()}`, name: `${name} response`, trigger, actions: actions.length ? actions : ['In-system'], recipient, active: true }]);
+    setOpen(false);
+    setNotice('Automation saved locally and will remain after refresh.');
+  }
+  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">SETUP / AUTOMATIONS</span><h2>Automations</h2><p>Choose what OptiVision should do after a detection or business rule is triggered.</p></div><button className="primary" type="button" onClick={() => setOpen(!open)}><Plus size={16} /> Create automation</button></div>{notice ? <div className="training-notice success"><Check size={16} />{notice}</div> : null}{open && <section className="panel automation-editor"><div className="section-heading"><div><h3>Create automation</h3><p>Configure the trigger, delivery actions, and responsible team.</p></div><button className="icon-button" type="button" onClick={() => setOpen(false)}><X size={17} /></button></div><div className="automation-flow"><div><span>1</span><strong>Trigger</strong><select aria-label="Trigger type"><option>Detection Rule</option><option>Business Rule</option><option>Threshold</option><option>Duration</option></select><select aria-label="Trigger rule" value={trigger} onChange={(event) => setTrigger(event.target.value)}><option>Machine Stopped = TRUE for 5 minutes</option><option>Worker Productivity &lt; 70%</option><option>Production Count &lt; 500</option><option>Worker Idle &gt; 10 minutes</option></select></div><ArrowRight size={20} /><div><span>2</span><strong>Actions</strong>{['Email', 'WhatsApp', 'In-system'].map((action) => <label key={action}><input type="checkbox" checked={actions.includes(action)} onChange={() => toggleAction(action)} /> {action === 'In-system' ? 'In-system notification' : action}</label>)}</div><ArrowRight size={20} /><div><span>3</span><strong>Recipients</strong><select aria-label="Recipient group" value={recipient} onChange={(event) => setRecipient(event.target.value)}><option>Production Manager</option><option>Maintenance Team</option></select><button className="add-inline" type="button"><Plus size={13} /> Add group</button></div></div><button className="primary" type="button" onClick={saveAutomation}><Save size={15} /> Save automation</button></section>}<section className="automation-list">{automations.map((automation) => <article className="panel" key={automation.id}><div className="automation-icon"><Zap size={19} /></div><div><strong>{automation.name}</strong><small>IF</small><p>{automation.trigger}</p></div><ArrowRight size={18} /><div><small>THEN</small><p>{automation.actions.join(' + ')}</p><span>{automation.recipient}</span></div><button className={`automation-status ${automation.active ? 'active' : ''}`} type="button" onClick={() => setAutomations((current) => current.map((item) => item.id === automation.id ? { ...item, active: !item.active } : item))}>{automation.active ? 'Active' : 'Paused'}</button><TableActions /></article>)}</section></div>;
 }
 
 function IntegrationsPage() {
@@ -856,10 +918,15 @@ function LegacyMonitoringPage({ setPage }: { setPage: (page: Page) => void }) {
 
 function MonitoringPage({ setPage }: { setPage: (page: Page) => void }) {
   const vision = useVision();
-  const [grid, setGrid] = useState('3');
+  const lpr = useLpr();
+  const [grid, setGrid] = useState(() => readStoredString('optivision-monitor-grid-v1', '3'));
   const [error, setError] = useState('');
+  useEffect(() => { writeStoredString('optivision-monitor-grid-v1', grid); }, [grid]);
   async function toggle(camera: CameraRecord) { setError(''); try { await vision.toggleEngine(camera.id); } catch (toggleError) { setError(toggleError instanceof Error ? toggleError.message : 'Could not start the camera.'); } }
-  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">USER MONITORING</span><h2>Live camera operations</h2><p>Real feed, Ultralytics detections, Supervision track IDs, rule results, and conveyor counts.</p></div><div className="page-controls"><select value={vision.activeCameraId} onChange={(event) => vision.setActiveCameraId(event.target.value)}>{vision.cameras.map((camera) => <option value={camera.id} key={camera.id}>{camera.name}</option>)}</select><select value={grid} onChange={(event) => setGrid(event.target.value)}><option value="1">1 camera</option><option value="2">2 cameras</option><option value="3">3 cameras</option></select></div></div>{error ? <div className="training-notice error"><AlertTriangle size={16} />{error}</div> : null}<section className={`monitor-grid columns-${grid}`}>{vision.cameras.slice(0, Number(grid)).map((camera) => { const frame = vision.frames[camera.id]; const session = vision.metrics[camera.id]; const observed = (session?.activeSeconds ?? 0) + (session?.idleSeconds ?? 0) + (session?.absentSeconds ?? 0); const productivity = observed ? Math.round((session?.activeSeconds ?? 0) / observed * 100) : 0; const people = frame?.detections.filter((detection) => detection.className === 'person').length ?? 0; const working = frame?.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active) ? people : 0; const idle = frame?.rules.some((rule) => rule.output === 'WORKER_IDLE' && rule.active) ? people : 0; const counter = frame?.signals.find((signal) => signal.kind === 'line_crossing_count'); const count = Number(counter?.evidence.totalCount ?? counter?.value ?? 0); const machineStopped = frame?.signals.some((signal) => signal.signalId === 'machine-idle' && signal.active); return <article className="monitor-card live-card" key={camera.id}><button className="monitor-open" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('camera-detail'); }}><div className="monitor-feed"><EmptyFeed compact cameraId={camera.id} /><span className={`camera-status ${camera.sourceStatus !== 'ready' || machineStopped ? 'stopped' : ''}`}><i /> {vision.running[camera.id] ? 'Detecting' : camera.sourceStatus === 'ready' ? 'Paused' : 'Not connected'}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{camera.name}</strong><small>{camera.location} · {camera.department}</small></span><ChevronRight size={18} /></div></button><div className="camera-parameters"><span><small>Worker present</small><strong>{people}</strong></span><span><small>Workers working</small><strong>{working}</strong></span><span><small>Workers idle</small><strong>{idle}</strong></span><span><small>Output count</small><strong>{count}</strong></span><span><small>Productivity</small><strong>{productivity}%</strong></span><span><small>Machine status</small><strong className={machineStopped ? 'danger-text' : 'success-text'}>{machineStopped ? 'STOPPED' : frame ? 'RUNNING' : 'WAITING'}</strong></span></div><footer className="monitor-controls"><button className="secondary" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('add-camera'); }}><Settings2 size={14} /> Configure</button><button className={vision.running[camera.id] ? 'secondary' : 'primary'} disabled={camera.sourceStatus !== 'ready'} type="button" onClick={() => void toggle(camera)}>{vision.running[camera.id] ? <Pause size={14} /> : <Play size={14} />}{vision.running[camera.id] ? 'Pause engine' : 'Start engine'}</button></footer>{camera.error ? <p className="camera-error-copy">{camera.error}</p> : null}</article>; })}</section><section className="panel engine-summary"><div><span className={`engine-dot ${vision.workerStatus}`} /><strong>{vision.workerStatus === 'online' ? 'OptiVision 2 engine online' : 'Signal worker offline'}</strong><small>{vision.workerDetail}</small></div><span>Ultralytics inference</span><span>Supervision ByteTrack</span><span>Strict ROI filtering</span><span>Direct-motion counting</span></section></div>;
+  const mappedCameraIds = new Set(lpr.processes.flatMap((process) => process.stages.filter((stage) => stage.cameraId).map((stage) => stage.cameraId)));
+  const readyCount = vision.cameras.filter((camera) => camera.sourceStatus === 'ready').length;
+  const runningCount = vision.cameras.filter((camera) => vision.running[camera.id]).length;
+  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">USER MONITORING</span><h2>Live camera operations</h2><p>Review each configured camera, its station assignment, connection state, and current operational results.</p></div><div className="page-controls"><select aria-label="Focused camera" value={vision.activeCameraId} onChange={(event) => vision.setActiveCameraId(event.target.value)}>{vision.cameras.map((camera) => <option value={camera.id} key={camera.id}>{camera.name}</option>)}</select><select aria-label="Camera grid size" value={grid} onChange={(event) => setGrid(event.target.value)}><option value="1">1 camera</option><option value="2">2 cameras</option><option value="3">3 cameras</option></select></div></div><section className="monitor-summary panel"><div><small>Configured</small><strong>{vision.cameras.length}</strong><span>camera{vision.cameras.length === 1 ? '' : 's'}</span></div><div><small>Connected</small><strong>{readyCount}</strong><span>feed{readyCount === 1 ? '' : 's'} ready</span></div><div><small>Monitoring</small><strong>{runningCount}</strong><span>engine{runningCount === 1 ? '' : 's'} active</span></div><div><small>Station mapped</small><strong>{mappedCameraIds.size}</strong><span>LPR checkpoint{mappedCameraIds.size === 1 ? '' : 's'}</span></div></section>{error ? <div className="training-notice error"><AlertTriangle size={16} />{error}</div> : null}<section className={`monitor-grid columns-${grid}`}>{vision.cameras.slice(0, Number(grid)).map((camera) => { const frame = vision.frames[camera.id]; const session = vision.metrics[camera.id]; const observed = (session?.activeSeconds ?? 0) + (session?.idleSeconds ?? 0) + (session?.absentSeconds ?? 0); const productivity = observed ? Math.round((session?.activeSeconds ?? 0) / observed * 100) : 0; const people = frame?.detections.filter((detection) => detection.className === 'person').length ?? 0; const working = frame?.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active) ? people : 0; const idle = frame?.rules.some((rule) => rule.output === 'WORKER_IDLE' && rule.active) ? people : 0; const counter = frame?.signals.find((signal) => signal.kind === 'line_crossing_count'); const count = Number(counter?.evidence.totalCount ?? counter?.value ?? 0); const machineStopped = frame?.signals.some((signal) => signal.signalId === 'machine-idle' && signal.active); const processAssignment = lpr.processes.flatMap((process) => process.stages.map((stage) => ({ process, stage }))).find((assignment) => assignment.stage.cameraId === camera.id); return <article className="monitor-card live-card" key={camera.id}><button className="monitor-open" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('camera-detail'); }}><div className="monitor-feed"><EmptyFeed compact cameraId={camera.id} /><span className={`camera-status ${camera.sourceStatus !== 'ready' || machineStopped ? 'stopped' : ''}`}><i /> {vision.running[camera.id] ? 'Detecting' : camera.sourceStatus === 'ready' ? 'Paused' : 'Not connected'}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{camera.name}</strong><small>{camera.location} · {camera.department}</small><em><Route size={12} />{processAssignment ? `${processAssignment.stage.name} · ${processAssignment.process.name}` : 'No station mapping'}</em></span><ChevronRight size={18} /></div></button><div className="camera-parameters"><span><small>Worker present</small><strong>{people}</strong></span><span><small>Workers working</small><strong>{working}</strong></span><span><small>Workers idle</small><strong>{idle}</strong></span><span><small>Output count</small><strong>{count}</strong></span><span><small>Productivity</small><strong>{productivity}%</strong></span><span><small>Machine status</small><strong className={machineStopped ? 'danger-text' : 'success-text'}>{machineStopped ? 'STOPPED' : frame ? 'RUNNING' : 'WAITING'}</strong></span></div><footer className="monitor-controls"><button className="secondary" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('add-camera'); }}><Settings2 size={14} /> Configure</button><button className={vision.running[camera.id] ? 'secondary' : 'primary'} disabled={camera.sourceStatus !== 'ready'} type="button" onClick={() => void toggle(camera)}>{vision.running[camera.id] ? <Pause size={14} /> : <Play size={14} />}{vision.running[camera.id] ? 'Pause engine' : 'Start engine'}</button></footer>{camera.error ? <p className="camera-error-copy">{camera.error}</p> : null}</article>; })}</section><section className="panel engine-summary"><div><span className={`engine-dot ${vision.workerStatus}`} /><strong>{vision.workerStatus === 'online' ? 'OptiVision 2 engine online' : 'Signal worker offline'}</strong><small>{vision.workerDetail}</small></div><span>Ultralytics inference</span><span>Supervision ByteTrack</span><span>Strict ROI filtering</span><span>Direct-motion counting</span></section></div>;
 }
 
 function LegacyCameraDetail({ setPage }: { setPage: (page: Page) => void }) {
@@ -904,7 +971,8 @@ function DashboardPage() {
   const recentDashboardEvents = vision.events.slice(0, 3);
   const [adding, setAdding] = useState(false);
   const [selected, setSelected] = useState('KPI');
-  const [widgets, setWidgets] = useState(['Worker Productivity', 'Machine Utilization', 'Output Count', 'Camera Feed', 'Production Trend', 'Recent Alerts']);
+  const [widgets, setWidgets] = useState<string[]>(loadDashboardWidgets);
+  useEffect(() => { writeStoredJson(dashboardWidgetsStorageKey, widgets); }, [widgets]);
   return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">MAIN DASHBOARD</span><h2>Operations overview</h2><p>Live business values calculated from the selected camera’s signal and rule results.</p></div><div className="definition-actions"><select value={vision.activeCameraId} onChange={(event) => vision.setActiveCameraId(event.target.value)}>{vision.cameras.map((camera) => <option value={camera.id} key={camera.id}>{camera.name}</option>)}</select><button className="primary" type="button" onClick={() => setAdding(true)}><Plus size={16} /> Add Widget</button></div></div><section className="dashboard-grid">{widgets.map((widget, index) => <article className={`dashboard-widget panel widget-${index}`} key={`${widget}-${index}`}><header><span><small>{index < 3 ? 'CURRENT SESSION' : 'LIVE OPERATIONS'}</small><strong>{widget}</strong></span><button type="button"><MoreHorizontal size={17} /></button></header>{index === 0 && <div className="big-kpi"><strong>{workerProductivity}%</strong><Pill tone={vision.running[dashboardCamera.id] ? 'green' : 'neutral'}>{vision.running[dashboardCamera.id] ? 'Live' : 'Paused'}</Pill><small>Working time / presence time</small></div>}{index === 1 && <div className="big-kpi"><strong>{machineUtilization}%</strong><Pill tone={vision.running[dashboardCamera.id] ? 'green' : 'neutral'}>{vision.running[dashboardCamera.id] ? 'Live' : 'Paused'}</Pill><small>Running time / observed time</small></div>}{index === 2 && <div className="big-kpi"><strong>{outputCount}</strong><Pill tone="orange">Current session</Pill><small>Confirmed conveyor passes</small></div>}{index === 3 && <EmptyFeed cameraId={dashboardCamera.id} compact />}{index === 4 && <div className="chart"><div className="chart-bars">{[42, 58, 51, 72, 68, Math.max(5, workerProductivity), 77, Math.max(5, machineUtilization), 86, Math.max(5, Math.min(100, outputCount))].map((height, bar) => <i key={bar} style={{ height: `${height}%` }} />)}</div><div><span>Start</span><span>Current session</span><span>Now</span></div></div>}{index === 5 && <div className="mini-alerts">{recentDashboardEvents.length ? recentDashboardEvents.map((event) => <span key={event.id}><i className={event.type === 'error' ? 'red' : event.type === 'count' ? 'green' : 'orange'} /><strong>{event.title}</strong><small>{new Date(event.timestamp * 1000).toLocaleTimeString()}</small></span>) : <span><i className="green" /><strong>No live events yet</strong><small>Start the engine</small></span>}</div>}</article>)}</section>{adding && <div className="modal-backdrop"><section className="widget-modal"><header><div><span className="eyebrow">DASHBOARD BUILDER</span><h2>Add Widget</h2><p>Select the widget and configure its data.</p></div><button className="icon-button" type="button" onClick={() => setAdding(false)}><X size={18} /></button></header><div className="widget-modal-body"><div className="widget-types">{widgetTypes.map((type) => <button className={selected === type ? 'selected' : ''} type="button" key={type} onClick={() => setSelected(type)}>{type === 'Camera Feed' ? <Camera size={17} /> : type === 'Chart' || type === 'Trend' ? <LineChart size={17} /> : <Gauge size={17} />}<span><strong>{type}</strong><small>Configured operational value</small></span>{selected === type && <Check size={14} />}</button>)}</div><div className="widget-config"><h3>Configure {selected}</h3><FormField label="Title"><input defaultValue={selected} /></FormField><FormField label="Data source"><select><option>Business Rule</option><option>Detection Rule</option><option>Camera</option></select></FormField><FormField label="Camera"><select value={vision.activeCameraId} onChange={(event) => vision.setActiveCameraId(event.target.value)}>{vision.cameras.map((camera) => <option value={camera.id} key={camera.id}>{camera.name}</option>)}</select></FormField><FormField label="Rule"><select><option>Worker Productivity</option><option>Machine Utilization</option><option>Output Count</option>{dashboardCamera.configuration.rules.map((rule) => <option key={rule.id}>{rule.name}</option>)}</select></FormField><FormField label="Time period"><select><option>Current session</option><option>Current shift</option><option>Today</option></select></FormField><FormField label="Formula"><input defaultValue="Current value" /></FormField><div className="form-grid"><FormField label="Refresh interval"><select><option>Live</option><option>5 seconds</option><option>1 minute</option></select></FormField><FormField label="Display format"><select><option>Number</option><option>Percentage</option></select></FormField><FormField label="Size"><select><option>Medium</option><option>Small</option><option>Large</option></select></FormField></div></div></div><footer><button className="secondary" type="button" onClick={() => setAdding(false)}>Cancel</button><button className="primary" type="button" onClick={() => { setWidgets([...widgets, selected]); setAdding(false); }}><Plus size={15} /> Add Widget</button></footer></section></div>}</div>;
 }
 
@@ -920,8 +988,9 @@ function NotificationsPage({ setPage }: { setPage: (page: Page) => void }) {
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>('monitoring');
+  const [page, setPage] = useState<Page>(loadStoredPage);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  useEffect(() => { writeStoredString(pageStorageKey, page); }, [page]);
   const content = useMemo(() => {
     if (page === 'setup-home') return <SetupHome setPage={setPage} />;
     if (page === 'add-camera') return <CameraWizard setPage={setPage} />;
@@ -934,10 +1003,10 @@ export function App() {
     if (page === 'training') return <TrainingPage />;
     if (page === 'camera-detail') return <CameraDetail setPage={setPage} />;
     if (page === 'dashboard') return <DashboardPage />;
-    if (page === 'lpr-cycle') return <LprCyclePage />;
+    if (page === 'lpr-cycle') return <LprTrackingPage initialSection="mapping" />;
     if (page === 'lpr-tracking') return <LprTrackingPage />;
     if (page === 'notifications') return <NotificationsPage setPage={setPage} />;
     return <MonitoringPage setPage={setPage} />;
   }, [page]);
-  return <div className="app-shell"><Sidebar page={page} setPage={(next) => { setPage(next); setSidebarOpen(false); }} open={sidebarOpen} /><div className="workspace"><AppHeader page={page} setPage={setPage} sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen} /><main className="content">{content}</main></div></div>;
+  return <div className="app-shell"><Sidebar page={page} setPage={(next) => { setPage(next); setSidebarOpen(false); }} open={sidebarOpen} /><div className="workspace"><AppHeader page={page} setPage={setPage} sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen} /><main className="content">{workflowPages.has(page) && page !== 'monitoring' ? <WorkflowGuide page={page} setPage={setPage} /> : null}{content}</main></div></div>;
 }

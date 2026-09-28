@@ -320,6 +320,22 @@ alert_service = AlertService(runtime_root / "alert-state.json")
 workspace_service = WorkspaceService(runtime_root / "workspace-state.json")
 registry: UltralyticsRegistry | None = None
 training_service: TrainingService | None = None
+MAX_JSON_BODY_BYTES = 256 * 1024 * 1024
+MAX_ANALYSIS_IMAGE_CHARACTERS = 16 * 1024 * 1024
+
+
+class RequestValidationError(ValueError):
+    def __init__(self, message: str, code: str = "INVALID_REQUEST", status: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def list_field(payload: dict[str, Any], name: str, default: list[Any] | None = None) -> list[Any]:
+    value = payload.get(name, default if default is not None else [])
+    if not isinstance(value, list):
+        raise RequestValidationError(f"{name} must be a JSON array.", "INVALID_FIELD_TYPE")
+    return value
 
 
 class SignalLabHandler(BaseHTTPRequestHandler):
@@ -451,21 +467,28 @@ class SignalLabHandler(BaseHTTPRequestHandler):
             if registry is None:
                 raise RuntimeError("Model registry is not ready")
 
-            image = decode_image(str(payload["image"]))
+            image_payload = payload.get("image")
+            if not isinstance(image_payload, str) or not image_payload:
+                raise RequestValidationError("image is required and must be a data URL string.", "IMAGE_REQUIRED")
+            if len(image_payload) > MAX_ANALYSIS_IMAGE_CHARACTERS:
+                raise RequestValidationError("The analysis frame is too large.", "FRAME_TOO_LARGE", 413)
+            camera_id = str(payload.get("cameraId") or "").strip()
+            if not camera_id:
+                raise RequestValidationError("cameraId is required.", "CAMERA_ID_REQUIRED")
+            image = decode_image(image_payload)
             height, width = image.shape[:2]
             confidence = max(0.01, min(1.0, float(payload.get("confidence", 0.35))))
-            model_ids = list(dict.fromkeys(str(model_id) for model_id in payload.get("modelIds", ["yolo11n"])))
+            model_ids = list(dict.fromkeys(str(model_id) for model_id in list_field(payload, "modelIds", ["yolo11n"])))
             raw_class_names = payload.get("classNames")
             class_names = (
                 list(dict.fromkeys(str(class_name).strip().lower() for class_name in raw_class_names if str(class_name).strip()))
                 if isinstance(raw_class_names, list)
                 else None
             )
-            camera_id = str(payload.get("cameraId", "signal-lab-camera"))
-            zones = list(payload.get("zones") or [])
+            zones = list_field(payload, "zones")
             analysis_roi_ids = {
                 str(zone_id)
-                for zone_id in payload.get("analysisRoiIds") or []
+                for zone_id in list_field(payload, "analysisRoiIds")
                 if str(zone_id)
             }
             minimum_roi_overlap = max(0.1, min(1.0, float(payload.get("minimumRoiOverlap", 0.5))))
@@ -492,14 +515,14 @@ class SignalLabHandler(BaseHTTPRequestHandler):
                 detections = filter_detections_to_analysis_rois(detections, analysis_roi_ids)
 
             timestamp = float(payload.get("timestamp", time()))
-            signal_definitions = list(payload.get("signalDefinitions") or [])
+            signal_definitions = list_field(payload, "signalDefinitions")
             counting_metrics, generic_detections = conveyor_runtime.analyze(
                 camera_id=camera_id,
                 timestamp=timestamp,
                 image=image,
                 detections=detections,
                 zones=zones,
-                counting_lines=list(payload.get("countingLines") or []),
+                counting_lines=list_field(payload, "countingLines"),
                 signal_definitions=signal_definitions,
             )
             detections.extend(generic_detections)
@@ -512,7 +535,7 @@ class SignalLabHandler(BaseHTTPRequestHandler):
                 detections=detections,
                 zones=zones,
                 signal_definitions=signal_definitions,
-                rules=list(payload.get("rules") or []),
+                rules=list_field(payload, "rules"),
                 zone_metrics=zone_metrics,
                 counting_metrics=counting_metrics,
             )
@@ -540,15 +563,30 @@ class SignalLabHandler(BaseHTTPRequestHandler):
                 "counting": list(counting_metrics.values()),
                 **evaluated,
             })
+        except RequestValidationError as error:
+            self._json({"ok": False, "code": error.code, "error": str(error)}, status=error.status)
         except Exception as error:
-            self._json({"ok": False, "error": str(error)}, status=400)
+            self._json({"ok": False, "code": "WORKER_REQUEST_FAILED", "error": str(error)}, status=400)
 
     def do_OPTIONS(self) -> None:
         self._json({"ok": True})
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("content-length", "0"))
-        return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError as error:
+            raise RequestValidationError("content-length must be an integer.", "INVALID_CONTENT_LENGTH") from error
+        if length < 0:
+            raise RequestValidationError("content-length cannot be negative.", "INVALID_CONTENT_LENGTH")
+        if length > MAX_JSON_BODY_BYTES:
+            raise RequestValidationError("Request body is too large.", "REQUEST_TOO_LARGE", 413)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RequestValidationError("Request body must contain valid UTF-8 JSON.", "INVALID_JSON") from error
+        if not isinstance(payload, dict):
+            raise RequestValidationError("Request body must be a JSON object.", "INVALID_JSON_OBJECT")
+        return payload
 
     def _json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")

@@ -19,6 +19,20 @@ function Test-Url([string]$Url) {
   }
 }
 
+function Test-WorkerHealth {
+  try {
+    $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8770/health' -TimeoutSec 2
+    return $health.ok -eq $true -and $health.service -eq 'optivision-signal-rule-lab'
+  } catch {
+    return $false
+  }
+}
+
+function Invoke-HiddenNpm([string[]]$Arguments, [string]$FailureMessage) {
+  $process = Start-Process -FilePath $npm -ArgumentList $Arguments -WorkingDirectory $projectRoot -Wait -WindowStyle Hidden -PassThru
+  if ($process.ExitCode -ne 0) { throw $FailureMessage }
+}
+
 if (-not (Test-Path -LiteralPath $workerPython) -or -not (Test-Path -LiteralPath $lprDetector) -or -not (Test-Path -LiteralPath $lprRecognizer)) {
   Write-Host 'First run detected. Installing the local AI engine...' -ForegroundColor Cyan
   & (Join-Path $PSScriptRoot 'setup-optivision.ps1')
@@ -35,7 +49,7 @@ $builtIndex = Join-Path $projectRoot 'dist\index.html'
 
 if (-not (Test-Path -LiteralPath $nodeModules)) {
   $installCommand = if (Test-Path -LiteralPath (Join-Path $projectRoot 'package-lock.json')) { 'ci' } else { 'install' }
-  Start-Process -FilePath $npm -ArgumentList @($installCommand) -WorkingDirectory $projectRoot -Wait -WindowStyle Hidden
+  Invoke-HiddenNpm @($installCommand) 'Frontend dependency installation failed. Run Setup OptiVision.cmd to see the complete error.'
 }
 
 $buildRequired = -not (Test-Path -LiteralPath $builtIndex)
@@ -49,10 +63,10 @@ if (-not $buildRequired) {
 }
 
 if ($buildRequired) {
-  Start-Process -FilePath $npm -ArgumentList @('run', 'build') -WorkingDirectory $projectRoot -Wait -WindowStyle Hidden
+  Invoke-HiddenNpm @('run', 'build') 'Frontend build failed. Run Verify OptiVision.cmd to see the complete error.'
 }
 
-if (-not (Test-Url 'http://127.0.0.1:8770/health')) {
+if (-not (Test-WorkerHealth)) {
   Start-Process -FilePath $workerPython -ArgumentList @('server.py', '--model-dir', (Join-Path $workerRoot 'models')) -WorkingDirectory $workerRoot -WindowStyle Hidden
 }
 
@@ -61,13 +75,13 @@ if (-not (Test-Url 'http://127.0.0.1:4180/')) {
 }
 
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
-  if ((Test-Url 'http://127.0.0.1:8770/health') -and (Test-Url 'http://127.0.0.1:4180/')) { break }
+  if ((Test-WorkerHealth) -and (Test-Url 'http://127.0.0.1:4180/')) { break }
   Start-Sleep -Milliseconds 500
 }
 
-if (-not (Test-Url 'http://127.0.0.1:4180/')) {
+if (-not (Test-WorkerHealth) -or -not (Test-Url 'http://127.0.0.1:4180/')) {
   Add-Type -AssemblyName PresentationFramework
-  [System.Windows.MessageBox]::Show('OptiVision did not start. Check that Node.js is installed, then try again.', 'OptiVision') | Out-Null
+  [System.Windows.MessageBox]::Show('OptiVision did not start completely. Run Verify OptiVision.cmd to identify the missing dependency or port conflict.', 'OptiVision') | Out-Null
   exit 1
 }
 
