@@ -33,7 +33,20 @@ The first setup needs an internet connection and several gigabytes of free disk 
 3. Wait until the window says **Setup complete**.
 4. Double-click **`Start OptiVision UI.cmd`** whenever you want to use OptiVision.
 
-Setup creates `worker/.venv`, installs the pinned AI packages, downloads the standard detection/pose models, fetches the Indian LPR detector/OCR files, installs frontend packages, and builds the dashboard. These downloaded files are intentionally not committed to Git because they are large.
+Setup creates `worker/.venv`, installs the pinned AI packages, downloads the standard detection/pose models, and clones the external Indian_LPR dependency at commit `43b6c37f1773741c7fae81681c4f4158d8be7c34`. It applies the OptiVision compatibility patch locally, verifies both LPR weights by loading the detector and OCR models, installs frontend packages, and builds the dashboard. The external checkout and downloaded/generated files are intentionally excluded from this repository.
+
+Frontend packages are reproduced from `package-lock.json` with `npm ci`; Python AI packages are pinned in `worker/requirements.txt`.
+
+### External LPR dependency
+
+- Upstream: `https://github.com/sanchit2843/Indian_LPR.git`
+- Pinned commit: `43b6c37f1773741c7fae81681c4f4158d8be7c34`
+- Local checkout: `worker/third_party/Indian_LPR`
+- Required weights: `weights/best_od.pth` and `weights/best_lprnet.pth`
+- Local compatibility changes: `infer_objectdet.py` and `src/object_detection/model/backbone/hrnet.py`
+- Compatibility patch owned by this project: `tools/patches/indian_lpr_compat.patch`
+
+The pinned upstream commit currently contains both required weight files, so setup obtains them directly by checking out that commit. OptiVision does not redistribute the upstream repository or its weights. If the upstream files become unavailable or invalid, setup stops and prints the exact required destination paths instead of silently disabling LPR.
 
 ## Easiest way to start
 
@@ -85,7 +98,7 @@ Uploaded videos play through their complete duration and then loop for repeat te
 
 ## Test the LPR lifecycle correctly
 
-1. Open **Lifecycle Management → Station Mapping**.
+1. Open **LPR Cycle → Station Mapping**.
 2. Assign one mapped camera as the **Start Station** and one as the **End Station**. Intermediate mapped cameras represent processing stations.
 3. Use **Whole camera frame** or select a plate ROI for each station.
 4. Click **Save & Start Mapped Cameras**.
@@ -131,7 +144,7 @@ Four reviewed images can test the workflow, but they are not sufficient for reli
 
 - **Site cannot be reached:** double-click `Start OptiVision UI.cmd` again and wait for the browser to open.
 - **Signal worker offline:** run `Setup OptiVision.cmd`, then start again. Check that `worker/.venv/Scripts/python.exe` exists.
-- **LPR model unavailable:** rerun setup and confirm `worker/third_party/Indian_LPR/weights/best_od.pth` and `best_lprnet.pth` exist.
+- **LPR model unavailable:** rerun setup and read the first LPR error. Confirm the checkout is at commit `43b6c37f1773741c7fae81681c4f4158d8be7c34`, then confirm `worker/third_party/Indian_LPR/weights/best_od.pth` and `best_lprnet.pth` exist. Setup never resets a conflicting modified checkout.
 - **Plate detected but no lifecycle:** confirm that camera is mapped as the Start Station and its engine is running.
 - **Old UI still visible:** press `Ctrl + F5`.
 - **RTSP feed is blank:** use an HLS/WebRTC/HTTP bridge rather than the raw RTSP URL.
@@ -153,6 +166,7 @@ Important frontend files:
 - `src/styles.css` — complete orange-and-white product styling and responsive layout.
 - `tools/start-optivision-ui.ps1` — zero-command Windows launcher.
 - `tools/setup-optivision.ps1` — reproducible frontend/AI setup and model download.
+- `tools/patches/indian_lpr_compat.patch` — the two required compatibility changes applied to the external pinned Indian_LPR checkout.
 
 Bundled backend files are in `worker/`:
 
@@ -163,6 +177,7 @@ Bundled backend files are in `worker/`:
 - `training.py` and `workspace.py` — customer-model training and persistent workspace state.
 - `requirements.txt` — pinned Python AI dependencies.
 - `download_models.py` — downloads standard Ultralytics detector/pose weights.
+- `verify_lpr.py` — loads both external LPR models during setup so a missing/incompatible dependency fails before launch.
 
 ### Runtime contract
 

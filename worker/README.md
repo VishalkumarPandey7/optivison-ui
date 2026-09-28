@@ -14,4 +14,4 @@ The worker exposes:
 
 Default address: `http://127.0.0.1:8770`.
 
-Indian LPR is fetched from `https://github.com/sanchit2843/Indian_LPR` during setup and stored under `worker/third_party/Indian_LPR`. That upstream project does not currently publish a conventional licence file; review redistribution terms before packaging it commercially.
+Indian LPR is cloned externally from `https://github.com/sanchit2843/Indian_LPR.git` at commit `43b6c37f1773741c7fae81681c4f4158d8be7c34` and stored under `worker/third_party/Indian_LPR`. Setup applies `tools/patches/indian_lpr_compat.patch`, verifies `weights/best_od.pth` and `weights/best_lprnet.pth`, and sets `OPTIVISION_LPR_ROOT` for the worker. That upstream project does not currently publish a conventional licence file; it is not copied into this repository, and its terms must be reviewed before commercial distribution.

@@ -1,0 +1,60 @@
+diff --git a/infer_objectdet.py b/infer_objectdet.py
+index 2daed58..c5076c8 100644
+--- a/infer_objectdet.py
++++ b/infer_objectdet.py
+@@ -13 +12,0 @@ from src.License_Plate_Recognition.model.LPRNet import build_lprnet
+-from src.License_Plate_Recognition.test_LPRNet import Greedy_Decode_inference
+@@ -19,0 +19,32 @@ from tqdm import tqdm
++CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
++
++
++def Greedy_Decode_inference(net, images):
++    """Decode the LPRNet output without importing training-only dependencies."""
++    if torch.cuda.is_available():
++        images = images.cuda()
++
++    predictions = net(images).cpu().detach().numpy()
++    labels = []
++    blank = len(CHARS) - 1
++
++    for prediction in predictions:
++        raw_label = np.argmax(prediction, axis=0)
++        decoded = []
++        previous = raw_label[0]
++        if previous != blank:
++            decoded.append(previous)
++
++        for character in raw_label:
++            if character == previous or character == blank:
++                if character == blank:
++                    previous = character
++                continue
++            decoded.append(character)
++            previous = character
++
++        labels.append("".join(CHARS[index] for index in decoded))
++
++    return labels
++
++
+@@ -141,0 +173 @@ def process_video(video_path, od_model, lprnet, output_dir):
++    video_stem = os.path.splitext(os.path.basename(video_path))[0]
+@@ -146,3 +178 @@ def process_video(video_path, od_model, lprnet, output_dir):
+-                os.path.join(
+-                    output_dir, video_path.split("/")[-1].replace("mp4", "avi")
+-                ),
++                os.path.join(output_dir, video_stem + ".avi"),
+@@ -163,5 +193 @@ def process_video(video_path, od_model, lprnet, output_dir):
+-        os.path.join(
+-            output_dir,
+-            "jsons",
+-            video_path.split("/")[-1].replace("mp4", "json").replace("avi", "json"),
+-        ),
++        os.path.join(output_dir, "jsons", video_stem + ".json"),
+diff --git a/src/object_detection/model/backbone/hrnet.py b/src/object_detection/model/backbone/hrnet.py
+index aa5f29a..7299210 100644
+--- a/src/object_detection/model/backbone/hrnet.py
++++ b/src/object_detection/model/backbone/hrnet.py
+@@ -413 +413 @@ class HighResolutionNet(nn.Module):
+-        last_inp_channels = np.int(np.sum(pre_stage_channels))
++        last_inp_channels = int(np.sum(pre_stage_channels))

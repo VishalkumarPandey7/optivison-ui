@@ -7,6 +7,8 @@ $env:OPTIVISION_RUNTIME_DIR = Join-Path $projectRoot 'runtime'
 if (-not $env:OPTIVISION_LPR_ROOT) {
   $env:OPTIVISION_LPR_ROOT = Join-Path $workerRoot 'third_party\Indian_LPR'
 }
+$lprDetector = Join-Path $env:OPTIVISION_LPR_ROOT 'weights\best_od.pth'
+$lprRecognizer = Join-Path $env:OPTIVISION_LPR_ROOT 'weights\best_lprnet.pth'
 
 function Test-Url([string]$Url) {
   try {
@@ -17,19 +19,23 @@ function Test-Url([string]$Url) {
   }
 }
 
-if (-not (Test-Path -LiteralPath $workerPython)) {
+if (-not (Test-Path -LiteralPath $workerPython) -or -not (Test-Path -LiteralPath $lprDetector) -or -not (Test-Path -LiteralPath $lprRecognizer)) {
   Write-Host 'First run detected. Installing the local AI engine...' -ForegroundColor Cyan
   & (Join-Path $PSScriptRoot 'setup-optivision.ps1')
+  $lprDetector = Join-Path $env:OPTIVISION_LPR_ROOT 'weights\best_od.pth'
+  $lprRecognizer = Join-Path $env:OPTIVISION_LPR_ROOT 'weights\best_lprnet.pth'
 }
 
 if (-not (Test-Path -LiteralPath $workerPython)) { throw 'The local AI engine is not installed. Run Setup OptiVision.cmd.' }
+if (-not (Test-Path -LiteralPath $lprDetector) -or -not (Test-Path -LiteralPath $lprRecognizer)) { throw "Indian_LPR is not ready at $env:OPTIVISION_LPR_ROOT. Run Setup OptiVision.cmd." }
 
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $nodeModules = Join-Path $projectRoot 'node_modules'
 $builtIndex = Join-Path $projectRoot 'dist\index.html'
 
 if (-not (Test-Path -LiteralPath $nodeModules)) {
-  Start-Process -FilePath $npm -ArgumentList @('install') -WorkingDirectory $projectRoot -Wait -WindowStyle Hidden
+  $installCommand = if (Test-Path -LiteralPath (Join-Path $projectRoot 'package-lock.json')) { 'ci' } else { 'install' }
+  Start-Process -FilePath $npm -ArgumentList @($installCommand) -WorkingDirectory $projectRoot -Wait -WindowStyle Hidden
 }
 
 $buildRequired = -not (Test-Path -LiteralPath $builtIndex)
