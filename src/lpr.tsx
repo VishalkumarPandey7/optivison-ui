@@ -1,13 +1,15 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowLeft, ArrowRight, BarChart3, Bell, CalendarDays, Car, Check, ChevronDown, CircleDot, Clock3, Download, FileText, Image, List, Mail, MapPin, Menu, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, Radio, RefreshCw, Route, Search, Settings2, ScanLine, Timer, Trash2, Truck, UserRound, Users, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ArrowRight, BarChart3, Bell, CalendarDays, Car, Check, ChevronDown, CircleDot, Clock3, Download, FileText, Image, List, Mail, MapPin, Menu, MessageCircle, MoreHorizontal, Pause, Pencil, Play, Plus, Radio, RefreshCw, Route, Search, Settings2, ScanLine, Timer, Trash2, Truck, UserRound, Users, X, Zap } from 'lucide-react';
 import { useVision, type AnalysisFrame } from './vision';
-import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
+import { backupStoredValue, isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
+import { migrateLifecycleAutomations, migrateLprProcesses, type MigratedLifecycleAutomation } from './state/migrations';
 
 type StageType = 'entry' | 'station' | 'exit';
 type WorkerState = 'working' | 'idle' | 'absent';
 
 export interface LprStage {
   id: string;
+  order: number;
   name: string;
   type: StageType;
   cameraId: string;
@@ -18,6 +20,7 @@ export interface LprStage {
 export interface LprProcess {
   id: string;
   name: string;
+  plantId?: string;
   modelId: 'indian_lpr';
   active: boolean;
   flowMode: 'strict' | 'flexible';
@@ -68,6 +71,7 @@ interface LprContextValue {
   setSelectedProcessId: (id: string) => void;
   addProcess: () => void;
   updateProcess: (id: string, update: Partial<LprProcess>) => void;
+  reorderStages: (processId: string, orderedStageIds: string[]) => void;
   removeProcess: (id: string) => void;
   recordScan: (processId: string, stageId: string, plate: string, workerState?: WorkerState, timestamp?: number) => void;
   updateJourneyPlate: (id: string, plate: string) => void;
@@ -94,6 +98,7 @@ export interface LprCandidate {
 
 const LprContext = createContext<LprContextValue | null>(null);
 const processStorageKey = 'optivision-lpr-processes-v2';
+const processStorageBackupKey = 'optivision-lpr-processes-v2:backup:pre-ordering';
 const selectedProcessStorageKey = 'optivision-lpr-selected-process-v1';
 const workspaceSectionStorageKey = 'optivision-lpr-workspace-section-v1';
 // v4 starts clean because earlier versions could create multiple journeys when
@@ -161,14 +166,15 @@ function stored<T>(key: string): T[] {
   return readStoredJson<T[]>(key, [], isArray<T>);
 }
 
-function defaultProcess(cameraId: string, zoneIds: string[]): LprProcess {
+function defaultProcess(cameraId: string, plantId: string, zoneIds: string[]): LprProcess {
   void zoneIds;
   const stations = ['Main Gate', 'Reception', 'Inspection Bay', 'Service Bay 1', 'QC', 'Washing', 'Delivery Yard', 'Exit Gate'];
   return {
-    id: 'vehicle-service-flow', name: 'Riverside Workshop - Main Setup', modelId: 'indian_lpr', active: true,
+    id: 'vehicle-service-flow', name: 'Vehicle Lifecycle', plantId, modelId: 'indian_lpr', active: true,
     flowMode: 'strict', minimumTransitionSeconds: 2, staleAfterMinutes: 30,
     stages: stations.map((name, index) => ({
       id: `station-${index + 1}`,
+      order: index,
       name,
       type: index === 0 ? 'entry' : index === stations.length - 1 ? 'exit' : 'station',
       cameraId: index === 0 ? cameraId : '',
@@ -218,8 +224,8 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
     const activeVisit = openVisit(journey, journey.currentStageId);
     const currentStageIndex = process.stages.findIndex((item) => item.id === journey.currentStageId);
     const observedStageIndex = process.stages.findIndex((item) => item.id === stage.id);
-    // A camera at an earlier station can continue seeing the same vehicle.
-    // Never let that late frame move a journey backwards.
+    // The entry-camera OCR creates the journey immediately. Once it exists,
+    // the selected flow mode controls how downstream station scans advance it.
     if (observedStageIndex >= 0 && currentStageIndex >= 0 && observedStageIndex < currentStageIndex) return current;
     const mappedStages = process.stages.filter((item) => item.cameraId);
     const currentMappedIndex = mappedStages.findIndex((item) => item.id === journey.currentStageId);
@@ -273,9 +279,32 @@ function workerStateFromFrame(frame: AnalysisFrame): WorkerState {
 export function LprProvider({ children }: { children: ReactNode }) {
   const vision = useVision();
   const [processes, setProcesses] = useState<LprProcess[]>(() => {
-    const saved = stored<LprProcess>(processStorageKey);
+    const raw = readStoredJson<unknown>(processStorageKey, []);
+    const saved = (migrateLprProcesses(raw) as unknown as LprProcess[]).map((process) => {
+      const plantId = process.plantId ?? vision.cameras.find((camera) => process.stages.some((stage) => stage.cameraId === camera.id))?.plantId ?? vision.selectedPlantId;
+      const entryStage = process.stages.find((stage) => stage.type === 'entry');
+      const entryCameraExists = Boolean(entryStage?.cameraId && vision.cameras.some((camera) => camera.id === entryStage.cameraId));
+      const assignedCameraIds = new Set(process.stages.map((stage) => stage.cameraId).filter(Boolean));
+      const fallbackEntryCamera = vision.cameras.find((camera) => camera.plantId === plantId && !assignedCameraIds.has(camera.id))
+        ?? vision.cameras.find((camera) => !assignedCameraIds.has(camera.id));
+      return {
+        ...process,
+        name: process.name === 'Riverside Workshop - Main Setup' ? 'Vehicle Lifecycle' : process.name,
+        plantId,
+        // Recover the legacy default mapping only when the saved Start station
+        // is empty or points to a camera that no longer exists. Station IDs and
+        // every valid user-selected mapping remain untouched.
+        stages: !entryStage || entryCameraExists || !fallbackEntryCamera
+          ? process.stages
+          : process.stages.map((stage) => stage.id === entryStage.id ? { ...stage, cameraId: fallbackEntryCamera.id, zoneId: '' } : stage)
+      };
+    });
+    if (Array.isArray(raw) && raw.length) {
+      backupStoredValue(processStorageKey, processStorageBackupKey);
+      writeStoredJson(processStorageKey, saved);
+    }
     const firstCamera = vision.cameras[0];
-    return saved.length ? saved : [defaultProcess(firstCamera.id, firstCamera.configuration.zones.map((zone) => zone.id))];
+    return saved.length ? saved : [defaultProcess(firstCamera.id, firstCamera.plantId, firstCamera.configuration.zones.map((zone) => zone.id))];
   });
   const [journeys, setJourneys] = useState<LprJourney[]>(() => stored<LprJourney>(journeyStorageKey));
   const [plateCandidates, setPlateCandidates] = useState<LprCandidate[]>([]);
@@ -289,6 +318,25 @@ export function LprProvider({ children }: { children: ReactNode }) {
   useEffect(() => { writeStoredJson(processStorageKey, processes); }, [processes]);
   useEffect(() => { writeStoredJson(journeyStorageKey, journeys.slice(0, 500)); }, [journeys]);
   useEffect(() => { writeStoredString(selectedProcessStorageKey, selectedProcessId); }, [selectedProcessId]);
+  useEffect(() => { writeStoredJson(lifecycleAutomationKey, loadLifecycleAutomations(processes)); }, []);
+  useEffect(() => {
+    const mappedCameraIds = new Set(
+      processes
+        .filter((process) => process.active)
+        .flatMap((process) => process.stages.map((stage) => stage.cameraId))
+        .filter(Boolean)
+    );
+    vision.cameras.forEach((camera) => {
+      if (!mappedCameraIds.has(camera.id) || camera.configuration.selectedModelIds.includes('indian_lpr')) return;
+      // A lifecycle station cannot produce plate scans unless its camera asks
+      // the worker to run Indian_LPR. Keep any existing object/pose models and
+      // add the required OCR model automatically when the station is mapped.
+      vision.updateConfiguration(camera.id, (configuration) => ({
+        ...configuration,
+        selectedModelIds: [...configuration.selectedModelIds, 'indian_lpr']
+      }));
+    });
+  }, [processes, vision.cameras, vision.updateConfiguration]);
 
   useEffect(() => {
     Object.entries(vision.frames).forEach(([cameraId, frame]) => {
@@ -370,10 +418,21 @@ export function LprProvider({ children }: { children: ReactNode }) {
     processes, journeys, plateCandidates, selectedProcessId, setSelectedProcessId,
     addProcess: () => {
       const camera = vision.getCamera();
-      const process = { ...defaultProcess(camera.id, camera.configuration.zones.map((zone) => zone.id)), id: `process-${Date.now()}`, name: `Vehicle Process ${processes.length + 1}` };
+      const process = { ...defaultProcess(camera.id, camera.plantId, camera.configuration.zones.map((zone) => zone.id)), id: `process-${Date.now()}`, name: `Vehicle Process ${processes.length + 1}` };
       setProcesses((current) => [...current, process]); setSelectedProcessId(process.id);
     },
-    updateProcess: (id, update) => setProcesses((current) => current.map((process) => process.id === id ? { ...process, ...update } : process)),
+    updateProcess: (id, update) => setProcesses((current) => current.map((process) => {
+      if (process.id !== id) return process;
+      const next = { ...process, ...update };
+      return { ...next, stages: next.stages.map((stage, index) => ({ ...stage, order: index })) };
+    })),
+    reorderStages: (processId, orderedStageIds) => setProcesses((current) => current.map((process) => {
+      if (process.id !== processId) return process;
+      const byId = new Map(process.stages.map((stage) => [stage.id, stage]));
+      const reordered = orderedStageIds.map((id) => byId.get(id)).filter((stage): stage is LprStage => Boolean(stage));
+      process.stages.forEach((stage) => { if (!orderedStageIds.includes(stage.id)) reordered.push(stage); });
+      return { ...process, stages: reordered.map((stage, index) => ({ ...stage, order: index })) };
+    })),
     removeProcess: (id) => setProcesses((current) => current.filter((process) => process.id !== id)),
     recordScan: (processId, stageId, plate, workerState = 'idle', timestamp = Date.now() / 1000) => {
       const process = processes.find((item) => item.id === processId); const stage = process?.stages.find((item) => item.id === stageId);
@@ -424,7 +483,7 @@ export function LegacyLprPage() {
 
   function updateStages(stages: LprStage[]) { if (process) lpr.updateProcess(process.id, { stages }); }
   function updateStage(id: string, update: Partial<LprStage>) { if (process) updateStages(process.stages.map((stage) => stage.id === id ? { ...stage, ...update } : stage)); }
-  function addStage() { if (!process) return; const camera = vision.getCamera(); updateStages([...process.stages, { id: `stage-${Date.now()}`, name: `Station ${process.stages.length}`, type: 'station', cameraId: camera.id, zoneId: camera.configuration.zones[0]?.id ?? '', trackWorker: true }]); }
+  function addStage() { if (!process) return; const camera = vision.getCamera(); updateStages([...process.stages, { id: `stage-${Date.now()}`, order: process.stages.length, name: `Station ${process.stages.length}`, type: 'station', cameraId: camera.id, zoneId: camera.configuration.zones[0]?.id ?? '', trackWorker: true }]); }
 
   const processJourneys = lpr.journeys.filter((journey) => !process || journey.processId === process.id);
   const activeJourneys = processJourneys.filter((journey) => journey.status === 'active');
@@ -443,14 +502,31 @@ export function LegacyLprPage() {
   </div>;
 }
 
-type LifecycleAutomation = { id: string; name: string; audience: string; trigger: string; channels: string[]; stations: string[]; shareImage: boolean; active: boolean };
-const lifecycleAutomationKey = 'optivision-lifecycle-automations-v1';
-const lifecycleAutomationDefaults: LifecycleAutomation[] = [
-  { id: 'customer-stage', name: 'Customer Stage Update', audience: 'Customer', trigger: 'Vehicle reached station', channels: ['WhatsApp', 'Email'], stations: ['Reception', 'Inspection Bay', 'Service Bay 1', 'QC', 'Delivery Yard'], shareImage: true, active: true },
-  { id: 'admin-summary', name: 'Admin Stage Summary', audience: 'Admin / Workshop Manager', trigger: 'Vehicle left station', channels: ['WhatsApp', 'Email'], stations: [], shareImage: true, active: true },
-  { id: 'delay-alert', name: 'Vehicle Delay Alert', audience: 'Customer', trigger: 'Vehicle delayed', channels: ['WhatsApp'], stations: [], shareImage: false, active: true },
-  { id: 'process-complete', name: 'End of Process Notification', audience: 'Customer', trigger: 'Vehicle exited end station', channels: ['Email'], stations: [], shareImage: false, active: false }
-];
+type LifecycleAutomation = MigratedLifecycleAutomation;
+const legacyLifecycleAutomationKey = 'optivision-lifecycle-automations-v1';
+const lifecycleAutomationKey = 'optivision-lifecycle-automations-v2';
+
+function defaultLifecycleAutomations(process?: LprProcess): LifecycleAutomation[] {
+  if (!process) return [];
+  const stationIds = process.stages.filter((stage) => stage.type === 'station').map((stage) => stage.id);
+  return [
+    { id: 'customer-stage', name: 'Customer Stage Update', audience: 'Customer', trigger: 'Vehicle reached station', channels: ['WhatsApp', 'Email'], processId: process.id, stationIds, unresolvedStationNames: [], shareImage: true, active: true },
+    { id: 'admin-summary', name: 'Admin Stage Summary', audience: 'Admin / Workshop Manager', trigger: 'Vehicle left station', channels: ['WhatsApp', 'Email'], processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: true, active: true },
+    { id: 'delay-alert', name: 'Vehicle Delay Alert', audience: 'Customer', trigger: 'Vehicle delayed', channels: ['WhatsApp'], processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: false, active: true },
+    { id: 'process-complete', name: 'End of Process Notification', audience: 'Customer', trigger: 'Vehicle exited end station', channels: ['Email'], processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: false, active: false }
+  ];
+}
+
+function loadLifecycleAutomations(processes: LprProcess[]) {
+  const current = readStoredJson<unknown>(lifecycleAutomationKey, null);
+  if (Array.isArray(current)) return migrateLifecycleAutomations(current, processes);
+  const legacy = readStoredJson<unknown>(legacyLifecycleAutomationKey, null);
+  const migrated = Array.isArray(legacy)
+    ? migrateLifecycleAutomations(legacy, processes)
+    : defaultLifecycleAutomations(processes[0]);
+  writeStoredJson(lifecycleAutomationKey, migrated);
+  return migrated;
+}
 
 function shortDuration(seconds: number) {
   const total = Math.max(0, Math.round(seconds));
@@ -488,6 +564,110 @@ function LifecycleMapping({ process }: { process: LprProcess }) {
     setNotice(unavailable.length ? `Mapping activated. Connect or configure: ${unavailable.join(', ')}` : `Mapping activated and ${cameraIds.length} mapped camera engine${cameraIds.length === 1 ? '' : 's'} started`);
   }
   return <div className="lm-stack"><div className="lm-page-head"><div><span>LPR Cycle <ArrowRight size={12} /> Station Mapping</span><h2>Lifecycle Station Mapping</h2><p>Map existing cameras to stations. A valid plate at the start station automatically creates its journey.</p></div><div><button className="lm-secondary" onClick={() => setNotice('Mapping saved. Lifecycle will start automatically when an entry plate is identified.')} type="button"><FileText size={15} />Save Mapping</button><button className="lm-primary" onClick={() => void activateAndStartMappedCameras()} type="button"><Play size={15} />Save &amp; Start Mapped Cameras</button></div></div>{notice ? <div className="lm-toast"><Check size={14} />{notice}</div> : null}<section className="lm-card lm-config"><h3><FileText size={18} />Configuration Details</h3><div><label><span>Configuration Name *</span><input value={process.name} onChange={(event) => lpr.updateProcess(process.id, { name: event.target.value })} /></label><label><span>Workshop *</span><select><option>Riverside Automotive Workshop</option></select></label><aside><AlertTriangle size={17} />Only one start station and one end station allowed.</aside></div><div className="lm-flow-settings"><label><span>Station flow</span><select value={process.flowMode ?? 'strict'} onChange={(event) => lpr.updateProcess(process.id, { flowMode: event.target.value as LprProcess['flowMode'] })}><option value="strict">Strict mapped order</option><option value="flexible">Allow station skipping</option></select></label><label><span>Minimum transition</span><div><input min="0" max="300" type="number" value={process.minimumTransitionSeconds ?? 2} onChange={(event) => lpr.updateProcess(process.id, { minimumTransitionSeconds: Math.max(0, Number(event.target.value)) })} /><small>seconds</small></div></label><label><span>Missing-exit review</span><div><input min="1" max="1440" type="number" value={process.staleAfterMinutes ?? 30} onChange={(event) => lpr.updateProcess(process.id, { staleAfterMinutes: Math.max(1, Number(event.target.value)) })} /><small>minutes</small></div></label></div></section><section className="lm-card lm-mapping"><header><MapPin size={20} /><div><h3>Station Mapping</h3><p>Assign cameras to each station. Vehicles will be tracked automatically based on the order of station entries.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>#</th><th>Station Name</th><th>Assigned Camera</th><th>Zone</th><th>Track Worker Activity</th><th>Start Station</th><th>End Station</th><th>Status</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); const isRunning = Boolean(stage.cameraId && vision.running[stage.cameraId]); return <tr key={stage.id}><td>{index + 1}</td><td><input value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{vision.cameras.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></td><td><select disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole camera frame</option>{camera?.configuration.zones.map((zone) => <option value={zone.id} key={zone.id}>{zone.name}</option>)}</select></td><td><button aria-label={`Track worker at ${stage.name}`} className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><button aria-label={`${stage.name} start station`} className={`lm-radio ${stage.type === 'entry' ? 'on' : ''}`} onClick={() => setBoundary(stage.id, 'entry')} type="button"><i /></button></td><td><button aria-label={`${stage.name} end station`} className={`lm-radio ${stage.type === 'exit' ? 'on' : ''}`} onClick={() => setBoundary(stage.id, 'exit')} type="button"><i /></button></td><td><span className={`lm-status ${isRunning ? 'green' : 'gray'}`}><i />{!stage.cameraId ? 'Unmapped' : isRunning ? 'Running' : camera?.sourceStatus === 'ready' ? 'Paused' : 'Not connected'}</span></td></tr>; })}</tbody></table></div><div className="lm-logic"><Settings2 size={22} /><span><strong>Automatic journey logic</strong><small>A valid plate at the mapped start camera immediately starts a separate lifecycle. Later mapped-station detections move only that matching vehicle forward.</small></span></div></section></div>;
+}
+
+export function LifecycleStationSetup({ plantId }: { plantId: string }) {
+  const vision = useVision();
+  const lpr = useLpr();
+  const [notice, setNotice] = useState('');
+  const [noticeTone, setNoticeTone] = useState<'success' | 'info'>('success');
+  const [newStationName, setNewStationName] = useState('');
+  const [newStationCameraId, setNewStationCameraId] = useState('');
+  const [newStationType, setNewStationType] = useState<StageType>('station');
+  const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
+  if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
+
+  const availableCameras = vision.cameras;
+  const mappedCameraIds = new Set(process.stages.map((stage) => stage.cameraId).filter(Boolean));
+  const lprModel = vision.models.find((model) => model.id === 'indian_lpr');
+  const updateStages = (stages: LprStage[]) => lpr.updateProcess(process.id, { stages });
+  const updateStage = (stageId: string, update: Partial<LprStage>) => updateStages(process.stages.map((stage) => stage.id === stageId ? { ...stage, ...update } : stage));
+  const setBoundary = (stageId: string, type: 'entry' | 'exit') => {
+    const selected = process.stages.find((stage) => stage.id === stageId);
+    if (!selected || selected.type === type) return;
+    // Swapping entry and exit directly must never leave the lifecycle without
+    // one of its required boundaries.
+    const priorType = selected.type;
+    updateStages(process.stages.map((stage) => {
+      if (stage.id === stageId) return { ...stage, type };
+      if (stage.type !== type) return stage;
+      return { ...stage, type: priorType === 'entry' || priorType === 'exit' ? priorType : 'station' };
+    }));
+  };
+  const moveStage = (stageId: string, direction: -1 | 1) => {
+    const index = process.stages.findIndex((stage) => stage.id === stageId);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= process.stages.length) return;
+    const ids = process.stages.map((stage) => stage.id);
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    lpr.reorderStages(process.id, ids);
+  };
+  const addStation = () => {
+    const name = newStationName.trim();
+    if (!name) {
+      setNoticeTone('info');
+      setNotice('Enter a name for the custom station.');
+      return;
+    }
+    if (newStationCameraId && mappedCameraIds.has(newStationCameraId)) {
+      setNoticeTone('info');
+      setNotice('That camera is already assigned to another station. Select a different camera.');
+      return;
+    }
+    const exitIndex = process.stages.findIndex((stage) => stage.type === 'exit');
+    const insertAt = newStationType === 'entry' ? 0 : newStationType === 'exit' ? process.stages.length : exitIndex >= 0 ? exitIndex : process.stages.length;
+    const stages = process.stages.map((stage) => stage.type === newStationType && newStationType !== 'station' ? { ...stage, type: 'station' as const } : stage);
+    stages.splice(insertAt, 0, {
+      id: `stage-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      order: insertAt,
+      name,
+      type: newStationType, cameraId: newStationCameraId, zoneId: '', trackWorker: newStationType === 'station'
+    });
+    updateStages(stages);
+    const cameraName = vision.cameras.find((camera) => camera.id === newStationCameraId)?.name;
+    setNoticeTone('success');
+    setNotice(cameraName ? `${name} was added and mapped to ${cameraName}.` : `${name} was added. You can assign its camera from the station row.`);
+    setNewStationName('');
+    setNewStationCameraId('');
+    setNewStationType('station');
+  };
+  const deleteStation = (stage: LprStage) => {
+    if (process.stages.length <= 2 || !window.confirm(`Delete ${stage.name}? Existing journey history will keep its station ID reference.`)) return;
+    const remaining = process.stages.filter((item) => item.id !== stage.id);
+    if (stage.type === 'entry') remaining[0] = { ...remaining[0], type: 'entry' };
+    if (stage.type === 'exit') remaining[remaining.length - 1] = { ...remaining[remaining.length - 1], type: 'exit' };
+    updateStages(remaining);
+  };
+  const saveAndStart = async () => {
+    const entryStage = process.stages.find((stage) => stage.type === 'entry');
+    if (!entryStage?.cameraId) {
+      setNoticeTone('info');
+      setNotice('Select a camera for the Start station. Plate detections cannot create a lifecycle until that camera is mapped.');
+      return;
+    }
+    lpr.updateProcess(process.id, { active: true, plantId });
+    const unavailable: string[] = [];
+    for (const cameraId of mappedCameraIds) {
+      const camera = vision.cameras.find((item) => item.id === cameraId);
+      if (!camera || camera.sourceStatus !== 'ready') { unavailable.push(camera?.name ?? cameraId); continue; }
+      if (!camera.configuration.selectedModelIds.includes('indian_lpr')) vision.updateConfiguration(cameraId, (configuration) => ({ ...configuration, selectedModelIds: [...configuration.selectedModelIds, 'indian_lpr'] }));
+      if (!vision.running[cameraId]) try { await vision.toggleEngine(cameraId); } catch { unavailable.push(camera.name); }
+    }
+    setNoticeTone(unavailable.length ? 'info' : 'success');
+    setNotice(unavailable.length ? `Mapping saved. Connect or configure: ${unavailable.join(', ')}` : 'Station mapping saved and mapped cameras started.');
+  };
+
+  return <div className="lm-stack setup-lifecycle-step">
+    <div className="lm-page-head"><div><span>Setup <ArrowRight size={12} /> Station Mapping</span><h2>Build the vehicle journey</h2><p>Add, rename, reorder, map or remove stations manually. Existing station IDs remain stable.</p></div><button className="lm-primary" type="button" onClick={() => void saveAndStart()}><Play size={15} />Save mapping</button></div>
+    {notice ? <div className={`inline-status ${noticeTone}`}>{noticeTone === 'success' ? <Check size={15} /> : <AlertTriangle size={15} />}<span><strong>{noticeTone === 'success' ? 'Lifecycle setup saved' : 'Lifecycle setup needs attention'}</strong><small>{notice}</small></span></div> : null}
+    {!lprModel?.installed ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Indian LPR is unavailable</strong><small>The worker does not have the external Indian_LPR checkout and required weights. A visible plate box without recognized OCR text cannot create a vehicle lifecycle.</small></span></div> : null}
+    <section className="lm-card lm-add-station">
+      <header><div><h3>Add station</h3><p>Create a station, choose its camera feed, and decide whether it starts or ends the lifecycle.</p></div><span>{availableCameras.length} cameras available</span></header>
+      <div><label><span>Station name *</span><input placeholder="Example: Paint Booth" value={newStationName} onChange={(event) => setNewStationName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') addStation(); }} /></label><label><span>Camera feed</span><select value={newStationCameraId} onChange={(event) => setNewStationCameraId(event.target.value)}><option value="">Assign camera later</option>{availableCameras.map((camera) => { const assignedStage = process.stages.find((stage) => stage.cameraId === camera.id); const plant = vision.plants.find((candidate) => candidate.id === camera.plantId); const cameraName = camera.name.trim() || camera.id; return <option disabled={Boolean(assignedStage)} key={camera.id} value={camera.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></label><label><span>Station role</span><select value={newStationType} onChange={(event) => setNewStationType(event.target.value as StageType)}><option value="station">Normal station</option><option value="entry">Start station</option><option value="exit">End station</option></select></label><button className="lm-primary" onClick={addStation} type="button"><Plus size={15} />Add station</button></div>
+      <small>Only one Start and one End station are active. Choosing either role here changes the previous boundary station back to a normal station.</small>
+    </section>
+    <section className="lm-card lm-mapping"><header><Route size={20} /><div><h3>Ordered stations</h3><p>Choose one start and one end station. Each camera can be used once; its plant is shown so entry and exit cameras can be mapped across sites.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Order</th><th>Station name</th><th>Camera</th><th>Zone</th><th>Worker activity</th><th>Start</th><th>End</th><th>Actions</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); return <tr key={stage.id}><td><div className="lm-order-actions"><button disabled={index === 0} aria-label={`Move ${stage.name} earlier`} onClick={() => moveStage(stage.id, -1)} type="button"><ArrowLeft size={13} /></button><strong>{index + 1}</strong><button disabled={index === process.stages.length - 1} aria-label={`Move ${stage.name} later`} onClick={() => moveStage(stage.id, 1)} type="button"><ArrowRight size={13} /></button></div></td><td><input aria-label={`Station ${index + 1} name`} value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select aria-label={`${stage.name} camera`} value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{availableCameras.map((item) => { const assignedStage = process.stages.find((other) => other.id !== stage.id && other.cameraId === item.id); const plant = vision.plants.find((candidate) => candidate.id === item.plantId); const cameraName = item.name.trim() || item.id; return <option disabled={Boolean(assignedStage)} key={item.id} value={item.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></td><td><select aria-label={`${stage.name} zone`} disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole frame</option>{camera?.configuration.zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></td><td><button className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} aria-label={`Track worker at ${stage.name}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} start station`} checked={stage.type === 'entry'} name={`lpr-start-${process.id}`} onChange={() => setBoundary(stage.id, 'entry')} type="radio" /><i /></label></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} end station`} checked={stage.type === 'exit'} name={`lpr-end-${process.id}`} onChange={() => setBoundary(stage.id, 'exit')} type="radio" /><i /></label></td><td><button className="lm-delete-station" disabled={process.stages.length <= 2} aria-label={`Delete ${stage.name}`} onClick={() => deleteStation(stage)} type="button"><Trash2 size={14} /></button></td></tr>; })}</tbody></table></div></section>
+  </div>;
 }
 
 function LifecycleTracking({ process, openSummary }: { process: LprProcess; openSummary: (journey: LprJourney) => void }) {
@@ -533,51 +713,101 @@ function LifecycleSummary({ process, journey, back }: { process: LprProcess; jou
 }
 
 function LifecycleAutomations({ process }: { process: LprProcess }) {
-  const [automations, setAutomations] = useState<LifecycleAutomation[]>(() => readStoredJson(lifecycleAutomationKey, lifecycleAutomationDefaults, isArray<LifecycleAutomation>));
+  const lpr = useLpr();
+  const [automations, setAutomations] = useState<LifecycleAutomation[]>(() => loadLifecycleAutomations(lpr.processes));
   const [trigger, setTrigger] = useState('Vehicle reached station'); const [audience, setAudience] = useState('Customer'); const [channel, setChannel] = useState('WhatsApp');
   useEffect(() => { writeStoredJson(lifecycleAutomationKey, automations); }, [automations]);
   const update = (id: string, value: Partial<LifecycleAutomation>) => setAutomations((items) => items.map((item) => item.id === id ? { ...item, ...value } : item));
-  return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Automations</span><h2>Lifecycle Automations</h2><p>Send real-time updates to customers and admins based on captured station events.</p></div></div><section className="lm-card lm-automation-create"><label><span>Trigger Event *</span><select value={trigger} onChange={(event) => setTrigger(event.target.value)}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Worker idle too long</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span>Recipients *</span><select value={audience} onChange={(event) => setAudience(event.target.value)}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span>Channel *</span><select value={channel} onChange={(event) => setChannel(event.target.value)}><option>WhatsApp</option><option>Email</option></select></label><button className="lm-primary" onClick={() => setAutomations((items) => [...items, { id: `automation-${Date.now()}`, name: `${trigger} Update`, audience, trigger, channels: [channel], stations: [], shareImage: false, active: true }])} type="button"><Plus size={17} />Create Automation</button></section><div className="lm-automation-cards">{automations.slice(0, 2).map((item, index) => <section className="lm-card" key={item.id}><header><div className={index ? 'orange' : 'green'}><Users size={20} /></div><span><h3>{item.name}</h3><p>{index ? 'Notify admins when a vehicle leaves a station or on stage completion.' : 'Notify customers when their vehicle reaches a station.'}</p></span><button className={`lm-toggle ${item.active ? 'on' : ''}`} onClick={() => update(item.id, { active: !item.active })} type="button"><i /></button><MoreHorizontal size={17} /></header><div className="lm-auto-grid"><label><span><Zap size={14} />Trigger Event</span><select value={item.trigger} onChange={(event) => update(item.id, { trigger: event.target.value })}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span><UserRound size={14} />Recipients</span><select value={item.audience} onChange={(event) => update(item.id, { audience: event.target.value })}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span><List size={14} />Stations / Events</span><div className="lm-tags">{(item.stations.length ? item.stations : process.stages.slice(1, 5).map((stage) => stage.name)).map((name) => <i key={name}>{name}</i>)}</div></label><label><span>Channels</span><div className="lm-channel"><MessageCircle size={16} />WhatsApp<button className={`lm-toggle ${item.channels.includes('WhatsApp') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('WhatsApp') ? item.channels.filter((value) => value !== 'WhatsApp') : [...item.channels, 'WhatsApp'] })} type="button"><i /></button></div><div className="lm-channel"><Mail size={16} />Email<button className={`lm-toggle ${item.channels.includes('Email') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('Email') ? item.channels.filter((value) => value !== 'Email') : [...item.channels, 'Email'] })} type="button"><i /></button></div></label></div><label className="lm-share"><Image size={15} />Share station image<button className={`lm-toggle ${item.shareImage ? 'on' : ''}`} onClick={() => update(item.id, { shareImage: !item.shareImage })} type="button"><i /></button></label><div className="lm-message"><MessageCircle size={15} /><span><small>Message Preview</small><strong>{item.audience === 'Customer' ? 'Your vehicle MH12AB1234 has reached Inspection.' : 'Vehicle MH12AB1234 completed Inspection. Stage time: 48 min.'}</strong></span></div></section>)}</div><div className="lm-automation-bottom"><section className="lm-card lm-active-automations"><header><List size={18} /><div><h3>Active Automations</h3><p>Manage your configured automations for lifecycle notifications.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Automation Name</th><th>Audience</th><th>Channels</th><th>Share Image</th><th>Status</th><th>Actions</th></tr></thead><tbody>{automations.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.audience}</td><td>{item.channels.join(' · ')}</td><td>{item.shareImage ? 'Yes' : 'No'}</td><td><span className={`lm-status ${item.active ? 'green' : 'gray'}`}><i />{item.active ? 'Active' : 'Inactive'}</span></td><td><button type="button"><Pencil size={14} /></button><button type="button"><MoreHorizontal size={14} /></button></td></tr>)}</tbody></table></div></section><aside className="lm-card lm-triggers"><header><Settings2 size={18} /><div><h3>Available Triggers</h3><p>Events that can start an automation.</p></div></header>{['Vehicle Entered Start Station', 'Vehicle Reached Station', 'Worker Idle Too Long', 'Vehicle Delayed', 'Vehicle Exited End Station'].map((item) => <button type="button" key={item}><Zap size={14} />{item}<ArrowRight size={14} /></button>)}</aside></div></div>;
+  const processAutomations = automations.filter((item) => item.processId === process.id);
+  const stationNames = (item: LifecycleAutomation) => {
+    const resolved = item.stationIds.map((id) => process.stages.find((stage) => stage.id === id)?.name ?? id);
+    return [...resolved, ...item.unresolvedStationNames];
+  };
+  return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Automations</span><h2>Lifecycle Automations</h2><p>Send real-time updates to customers and admins based on captured station events.</p></div></div><section className="lm-card lm-automation-create"><label><span>Trigger Event *</span><select value={trigger} onChange={(event) => setTrigger(event.target.value)}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Worker idle too long</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span>Recipients *</span><select value={audience} onChange={(event) => setAudience(event.target.value)}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span>Channel *</span><select value={channel} onChange={(event) => setChannel(event.target.value)}><option>WhatsApp</option><option>Email</option></select></label><button className="lm-primary" onClick={() => setAutomations((items) => [...items, { id: `automation-${Date.now()}`, name: `${trigger} Update`, audience, trigger, channels: [channel], processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: false, active: true }])} type="button"><Plus size={17} />Create Automation</button></section><div className="lm-automation-cards">{processAutomations.slice(0, 2).map((item, index) => <section className="lm-card" key={item.id}><header><div className={index ? 'orange' : 'green'}><Users size={20} /></div><span><h3>{item.name}</h3><p>{index ? 'Notify admins when a vehicle leaves a station or on stage completion.' : 'Notify customers when their vehicle reaches a station.'}</p></span><button className={`lm-toggle ${item.active ? 'on' : ''}`} onClick={() => update(item.id, { active: !item.active })} type="button"><i /></button><MoreHorizontal size={17} /></header><div className="lm-auto-grid"><label><span><Zap size={14} />Trigger Event</span><select value={item.trigger} onChange={(event) => update(item.id, { trigger: event.target.value })}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span><UserRound size={14} />Recipients</span><select value={item.audience} onChange={(event) => update(item.id, { audience: event.target.value })}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span><List size={14} />Stations / Events</span><div className="lm-tags">{(stationNames(item).length ? stationNames(item) : process.stages.slice(1, 5).map((stage) => stage.name)).map((name) => <i key={name}>{name}</i>)}</div></label><label><span>Channels</span><div className="lm-channel"><MessageCircle size={16} />WhatsApp<button className={`lm-toggle ${item.channels.includes('WhatsApp') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('WhatsApp') ? item.channels.filter((value) => value !== 'WhatsApp') : [...item.channels, 'WhatsApp'] })} type="button"><i /></button></div><div className="lm-channel"><Mail size={16} />Email<button className={`lm-toggle ${item.channels.includes('Email') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('Email') ? item.channels.filter((value) => value !== 'Email') : [...item.channels, 'Email'] })} type="button"><i /></button></div></label></div><label className="lm-share"><Image size={15} />Share station image<button className={`lm-toggle ${item.shareImage ? 'on' : ''}`} onClick={() => update(item.id, { shareImage: !item.shareImage })} type="button"><i /></button></label><div className="lm-message"><MessageCircle size={15} /><span><small>Message Preview</small><strong>{item.audience === 'Customer' ? 'Your vehicle MH12AB1234 has reached Inspection.' : 'Vehicle MH12AB1234 completed Inspection. Stage time: 48 min.'}</strong></span></div></section>)}</div><div className="lm-automation-bottom"><section className="lm-card lm-active-automations"><header><List size={18} /><div><h3>Active Automations</h3><p>Manage your configured automations for lifecycle notifications.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Automation Name</th><th>Audience</th><th>Channels</th><th>Share Image</th><th>Status</th><th>Actions</th></tr></thead><tbody>{processAutomations.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.audience}</td><td>{item.channels.join(' · ')}</td><td>{item.shareImage ? 'Yes' : 'No'}</td><td><span className={`lm-status ${item.active ? 'green' : 'gray'}`}><i />{item.active ? 'Active' : 'Inactive'}</span></td><td><button type="button"><Pencil size={14} /></button><button type="button"><MoreHorizontal size={14} /></button></td></tr>)}</tbody></table></div></section><aside className="lm-card lm-triggers"><header><Settings2 size={18} /><div><h3>Available Triggers</h3><p>Events that can start an automation.</p></div></header>{['Vehicle Entered Start Station', 'Vehicle Reached Station', 'Worker Idle Too Long', 'Vehicle Delayed', 'Vehicle Exited End Station'].map((item) => <button type="button" key={item}><Zap size={14} />{item}<ArrowRight size={14} /></button>)}</aside></div></div>;
+}
+
+export function LifecycleAutomationSetup() {
+  const lpr = useLpr();
+  const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
+  const [automations, setAutomations] = useState<LifecycleAutomation[]>(() => loadLifecycleAutomations(lpr.processes));
+  useEffect(() => { writeStoredJson(lifecycleAutomationKey, automations); }, [automations]);
+  if (!process) return <div className="lm-empty">Configure a lifecycle process before creating lifecycle automations.</div>;
+  const processAutomations = automations.filter((item) => item.processId === process.id);
+  const update = (id: string, value: Partial<LifecycleAutomation>) => setAutomations((items) => items.map((item) => item.id === id ? { ...item, ...value } : item));
+  const createAutomation = () => setAutomations((items) => [...items, {
+    id: `automation-${Date.now()}`,
+    name: 'New lifecycle update', audience: 'Customer', trigger: 'Vehicle reached station', channels: ['Email'],
+    processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: false, active: true
+  }]);
+  const toggleStation = (automation: LifecycleAutomation, stationId: string) => update(automation.id, {
+    stationIds: automation.stationIds.includes(stationId)
+      ? automation.stationIds.filter((id) => id !== stationId)
+      : [...automation.stationIds, stationId]
+  });
+  return <div className="lm-stack setup-lifecycle-step">
+    <div className="lm-page-head"><div><span>Setup <ArrowRight size={12} /> Automations</span><h2>Lifecycle automations</h2><p>Configure notifications from the stations in {process.name}. General detection and business-rule automations remain separate.</p></div><button className="lm-primary" type="button" onClick={createAutomation}><Plus size={16} />Create automation</button></div>
+    <section className="lm-card lifecycle-process-picker"><label><span>Lifecycle process</span><select value={process.id} onChange={(event) => lpr.setSelectedProcessId(event.target.value)}>{lpr.processes.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><p>Station selections below are stored by stable station ID, so renaming a station will not disconnect an automation.</p></section>
+    <div className="setup-automation-list">{processAutomations.map((item) => <section className="lm-card setup-automation-card" key={item.id}><header><div><Zap size={18} /></div><input aria-label="Automation name" value={item.name} onChange={(event) => update(item.id, { name: event.target.value })} /><button className={`lm-toggle ${item.active ? 'on' : ''}`} aria-label={`Toggle ${item.name}`} onClick={() => update(item.id, { active: !item.active })} type="button"><i /></button></header><div className="setup-automation-fields"><label><span>Trigger</span><select value={item.trigger} onChange={(event) => update(item.id, { trigger: event.target.value })}><option>Vehicle entered start station</option><option>Vehicle reached station</option><option>Vehicle left station</option><option>Worker idle too long</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span>Recipients</span><select value={item.audience} onChange={(event) => update(item.id, { audience: event.target.value })}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span>Channels</span><div className="automation-channel-options">{['Email', 'WhatsApp'].map((channel) => <button className={item.channels.includes(channel) ? 'selected' : ''} key={channel} onClick={() => update(item.id, { channels: item.channels.includes(channel) ? item.channels.filter((value) => value !== channel) : [...item.channels, channel] })} type="button">{channel}</button>)}</div></label></div><div className="automation-station-picker"><strong>Stations</strong><p>Select the configured stations that can trigger this automation.</p><div>{process.stages.map((stage) => <label className={item.stationIds.includes(stage.id) ? 'selected' : ''} key={stage.id}><input checked={item.stationIds.includes(stage.id)} onChange={() => toggleStation(item, stage.id)} type="checkbox" /><span>{stage.name}<small>{stage.type} · ID {stage.id}</small></span></label>)}</div>{item.unresolvedStationNames.length ? <aside className="automation-unresolved"><AlertTriangle size={15} /><span><strong>Legacy stations need review</strong><small>{item.unresolvedStationNames.join(' · ')}</small></span></aside> : null}</div><footer><label><input checked={item.shareImage} onChange={(event) => update(item.id, { shareImage: event.target.checked })} type="checkbox" /> Include station image</label><button className="lm-danger" type="button" onClick={() => setAutomations((items) => items.filter((automation) => automation.id !== item.id))}><Trash2 size={14} />Delete</button></footer></section>)}{!processAutomations.length ? <div className="panel setup-empty-state"><Zap size={25} /><strong>No lifecycle automations for this process</strong><p>Create one after your station mapping is ready.</p></div> : null}</div>
+  </div>;
 }
 
 function LifecyclePlateStatus({ process }: { process: LprProcess }) {
   const lpr = useLpr();
   const candidates = lpr.plateCandidates.filter((candidate) => candidate.processId === process.id);
   if (!candidates.length) return null;
-  return <section className="lm-card lm-plate-readings"><header><ScanLine size={18} /><div><h3>Live Plate Recognition</h3><p>The first valid detection is cropped, recognized and stored. Later readings, the saved image and station order keep the same vehicle linked across cameras.</p></div></header><div>{candidates.map((candidate) => { const stage = process.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>Captured and stored</strong><small>{stage?.name ?? 'Unmapped station'} · OCR {candidate.plate} · {candidate.observations} linked reading{candidate.observations === 1 ? '' : 's'}</small><i><b style={{ width: '100%' }} /></i></span></article>; })}</div></section>;
+  return <section className="lm-card lm-plate-readings"><header><ScanLine size={18} /><div><h3>Live Plate Recognition</h3><p>The first valid entry-camera detection is cropped, recognized and stored. Later mapped-camera readings and the saved image keep the same vehicle linked.</p></div></header><div>{candidates.map((candidate) => { const stage = process.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>Captured and stored</strong><small>{stage?.name ?? 'Unmapped station'} · OCR {candidate.plate} · {candidate.observations} linked reading{candidate.observations === 1 ? '' : 's'}</small><i><b style={{ width: '100%' }} /></i></span></article>; })}</div></section>;
 }
 
 type LifecycleWorkspaceSection = 'tracking' | 'mapping' | 'automations';
 
 export function LprTrackingPage({ initialSection = 'tracking' }: { initialSection?: LifecycleWorkspaceSection }) {
+  const vision = useVision();
   const lpr = useLpr();
-  const [section, setSection] = useState<LifecycleWorkspaceSection>(() => {
-    const storedSection = readStoredString(workspaceSectionStorageKey) as LifecycleWorkspaceSection;
-    return storedSection && ['tracking', 'mapping', 'automations'].includes(storedSection) ? storedSection : initialSection;
-  });
-  const [menuOpen, setMenuOpen] = useState(false);
+  void initialSection;
+  const section: LifecycleWorkspaceSection = 'tracking';
   const [selectedJourneyId, setSelectedJourneyId] = useState('');
   const [showSummary, setShowSummary] = useState(false);
+  const [previewImage, setPreviewImage] = useState<{ src: string; plate: string } | null>(null);
   useEffect(() => { writeStoredString(workspaceSectionStorageKey, section); }, [section]);
+  useEffect(() => {
+    if (!previewImage) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPreviewImage(null);
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [previewImage]);
   const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
   const journey = lpr.journeys.find((item) => item.id === selectedJourneyId) ?? lpr.journeys.find((item) => item.processId === process?.id);
   if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
+  const entryStage = process.stages.find((stage) => stage.type === 'entry');
+  const entryCamera = vision.cameras.find((camera) => camera.id === entryStage?.cameraId);
+  const lprModel = vision.models.find((model) => model.id === 'indian_lpr');
+  const lifecycleBlocker = vision.workerStatus !== 'online'
+    ? 'The AI worker is offline.'
+    : !lprModel?.installed
+      ? 'Indian LPR is not installed in this worker. The external checkout and both LPR weights are required for OCR.'
+      : !entryStage?.cameraId
+        ? 'No camera is mapped to the start station.'
+        : !entryCamera
+          ? 'The start-station camera no longer exists.'
+          : entryCamera.sourceStatus !== 'ready'
+            ? `${entryCamera.name} has no connected feed.`
+            : !entryCamera.configuration.selectedModelIds.includes('indian_lpr')
+              ? `${entryCamera.name} is not configured to use Indian LPR.`
+              : !vision.running[entryCamera.id]
+                ? `${entryCamera.name} is mapped but its engine is paused.`
+                : '';
   const openSummary = (item: LprJourney) => { setSelectedJourneyId(item.id); setShowSummary(true); };
-  return <div className="lifecycle-module">
-    <div className="lifecycle-workspace-menu">
-      <button className="lifecycle-menu-trigger" aria-expanded={menuOpen} aria-haspopup="menu" onClick={() => setMenuOpen((open) => !open)} type="button">
-        <Menu size={19} />
-        <span>{section === 'tracking' ? 'Tracking' : section === 'mapping' ? 'Station Mapping' : 'Automations'}</span>
-        <ChevronDown className={menuOpen ? 'open' : ''} size={16} />
-      </button>
-      {menuOpen ? <div className="lifecycle-menu-popover" role="menu" aria-label="Lifecycle view">
-        <button className={section === 'tracking' ? 'active' : ''} onClick={() => { setSection('tracking'); setMenuOpen(false); }} role="menuitem" type="button"><Route size={16} /><span><strong>Tracking</strong><small>View vehicles and journey progress</small></span></button>
-        <button className={section === 'mapping' ? 'active' : ''} onClick={() => { setSection('mapping'); setMenuOpen(false); }} role="menuitem" type="button"><MapPin size={16} /><span><strong>Station Mapping</strong><small>Connect cameras to lifecycle stations</small></span></button>
-        <button className={section === 'automations' ? 'active' : ''} onClick={() => { setSection('automations'); setMenuOpen(false); }} role="menuitem" type="button"><Zap size={16} /><span><strong>Automations</strong><small>Configure lifecycle notifications</small></span></button>
-      </div> : null}
-    </div>
+  return <div className="lifecycle-module" onClick={(event) => { const target = event.target; if (target instanceof HTMLImageElement && (target.classList.contains('lm-candidate-image') || target.classList.contains('lm-journey-plate-image'))) setPreviewImage({ src: target.src, plate: target.alt }); }}>
+    <div className="lifecycle-operation-context"><Route size={17} /><span><strong>Operational tracking</strong><small>Station mapping and notification setup are managed in Setup.</small></span></div>
+    {lifecycleBlocker ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Lifecycle capture is not ready</strong><small>{lifecycleBlocker} A journey is registered only after the mapped entry camera returns valid OCR text containing 6–12 characters, at least two letters, and at least two digits.</small></span></div> : null}
     {section === 'tracking' ? <><LifecyclePlateStatus process={process} />{showSummary ? <LifecycleSummary process={process} journey={journey} back={() => setShowSummary(false)} /> : <LifecycleTracking process={process} openSummary={openSummary} />}</> : null}
-    {section === 'mapping' ? <LifecycleMapping process={process} /> : null}
-    {section === 'automations' ? <LifecycleAutomations process={process} /> : null}
+    {previewImage ? <div className="plate-preview-backdrop" role="presentation" onClick={() => setPreviewImage(null)}><section aria-label={`Plate preview ${previewImage.plate}`} aria-modal="true" className="plate-preview-modal" role="dialog" onClick={(event) => event.stopPropagation()}><header><span><small>NUMBER PLATE PREVIEW</small><strong>{previewImage.plate}</strong></span><button aria-label="Close plate preview" autoFocus onClick={() => setPreviewImage(null)} title="Close preview" type="button"><X size={22} /></button></header><div className="plate-preview-image-stage"><img alt={`Detected number plate ${previewImage.plate}`} src={previewImage.src} /></div><footer><span>Detected vehicle number</span><strong>{previewImage.plate}</strong><small>Click outside, press Escape, or use the close button to return.</small></footer></section></div> : null}
   </div>;
 }

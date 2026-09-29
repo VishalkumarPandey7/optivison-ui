@@ -37,5 +37,16 @@ export function writeStoredString(key: string, value: string): boolean {
   }
 }
 
-export const isArray = <T>(value: unknown): value is T[] => Array.isArray(value);
+export function backupStoredValue(sourceKey: string, backupKey: string): boolean {
+  try {
+    if (window.localStorage.getItem(backupKey) !== null) return true;
+    const value = window.localStorage.getItem(sourceKey);
+    if (value === null) return true;
+    window.localStorage.setItem(backupKey, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
+export const isArray = <T>(value: unknown): value is T[] => Array.isArray(value);

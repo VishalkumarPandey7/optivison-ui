@@ -54,6 +54,7 @@ import {
   trainingApi,
   useVision,
   type CameraRecord,
+  type CameraCardMetric,
   type BusinessMetricKey,
   type BusinessRuleDefinition,
   type CountingLine,
@@ -66,8 +67,9 @@ import {
   type Zone
 } from './vision';
 import { builtInRuleTemplates, builtInSignalTemplates, createSignalFromTemplate, type RuleTemplate, type SignalTemplate } from './templates';
-import { LprTrackingPage, useLpr } from './lpr';
+import { LifecycleAutomationSetup, LifecycleStationSetup, LprTrackingPage, useLpr } from './lpr';
 import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
+import { readSetupDraft, writeSetupDraft } from './state/setupState';
 
 type Page =
   | 'setup-home'
@@ -105,8 +107,20 @@ function loadDashboardWidgets() {
   return parsed.length ? parsed : fallback;
 }
 
+function distinctNotificationEvents<T extends { cameraId: string; detail: string; id: string; title: string; type: string }>(events: T[]) {
+  const repeatedErrors = new Set<string>();
+  return events.filter((event) => {
+    if (event.type !== 'error') return true;
+    const key = `${event.cameraId}:${event.title}:${event.detail}`;
+    if (repeatedErrors.has(key)) return false;
+    repeatedErrors.add(key);
+    return true;
+  });
+}
+
 const setupNavigation: Array<{ id: Page; label: string; icon: typeof Camera }> = [
   { id: 'setup-home', label: 'Setup overview', icon: Layers3 },
+  { id: 'add-camera', label: 'Configuration flow', icon: Settings2 },
   { id: 'cameras', label: 'Cameras', icon: Camera },
   { id: 'signals', label: 'Manage signals', icon: Activity },
   { id: 'detection-rules', label: 'Detection rules', icon: Waypoints },
@@ -135,16 +149,19 @@ function WorkflowGuide({ page, setPage }: { page: Page; setPage: (page: Page) =>
 }
 
 const wizardSteps = [
-  'Camera Source',
+  'Plant',
+  'Cameras',
   'Feed Preview',
   'ROI / Zones',
   'Model',
-  'Display',
+  'Display Parameters',
+  'User Parameters',
   'Detection Signals',
   'Detection Rules',
   'Business Rules',
+  'Station Mapping',
   'Automations',
-  'Save'
+  'Save / Review'
 ];
 
 const models = [
@@ -251,8 +268,14 @@ function EmptyFeed({
         controls={sourceReady && !editor && !compact}
         loop={camera.sourceType === 'uploaded'}
         muted
-        onDurationChange={(event) => setPlayback((current) => ({ ...current, duration: Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0 }))}
-        onTimeUpdate={(event) => setPlayback({ current: event.currentTarget.currentTime, duration: Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0 })}
+        onDurationChange={(event) => {
+          const duration = event.currentTarget.duration;
+          setPlayback((current) => ({ ...current, duration: Number.isFinite(duration) ? duration : 0 }));
+        }}
+        onTimeUpdate={(event) => {
+          const { currentTime, duration } = event.currentTarget;
+          setPlayback({ current: currentTime, duration: Number.isFinite(duration) ? duration : 0 });
+        }}
         playsInline
         preload="auto"
         ref={setVideoNode}
@@ -278,14 +301,14 @@ function EmptyFeed({
 
 function AppHeader({ page, setPage, sidebarOpen, setSidebarOpen }: { page: Page; setPage: (page: Page) => void; sidebarOpen: boolean; setSidebarOpen: (open: boolean) => void }) {
   const vision = useVision();
-  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'lpr-cycle' || page === 'lpr-tracking' ? 'Lifecycle Tracking' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  const title = page === 'camera-detail' ? vision.getCamera().name : page === 'setup-home' ? 'Setup' : page === 'add-camera' ? 'Configuration Setup' : page === 'lpr-cycle' || page === 'lpr-tracking' ? 'Lifecycle Tracking' : page.replaceAll('-', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   return (
     <header className="app-header">
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen(!sidebarOpen)}><Menu size={20} /></button>
       <div><span className="breadcrumb">OptiVision / {page.startsWith('setup') || setupNavigation.some((item) => item.id === page) ? 'Setup' : 'Operations'}</span><h1>{title}</h1></div>
       <div className="header-actions">
         <label className="search"><Search size={16} /><input aria-label="Search" placeholder="Search cameras, rules, events..." /></label>
-        <button className="icon-button notification-button" type="button" onClick={() => setPage('notifications')}><Bell size={18} />{vision.events.length ? <i /> : null}</button>
+        <button className="icon-button notification-button" type="button" onClick={() => setPage('notifications')}><Bell size={18} />{distinctNotificationEvents(vision.events).length ? <i /> : null}</button>
         <span className={`live-chip ${vision.workerStatus}`} title={vision.workerDetail}><i /> {vision.workerStatus === 'online' ? 'Engine online' : vision.workerStatus === 'checking' ? 'Checking engine' : 'Engine offline'}</span>
         <button className="avatar" type="button">VP</button>
       </div>
@@ -295,6 +318,7 @@ function AppHeader({ page, setPage, sidebarOpen, setSidebarOpen }: { page: Page;
 
 function Sidebar({ page, setPage, open }: { page: Page; setPage: (page: Page) => void; open: boolean }) {
   const vision = useVision();
+  const notificationCount = distinctNotificationEvents(vision.events).length;
   return (
     <aside className={`sidebar ${open ? 'open' : ''}`}>
       <Brand />
@@ -303,11 +327,11 @@ function Sidebar({ page, setPage, open }: { page: Page; setPage: (page: Page) =>
         <button className={page === 'monitoring' || page === 'camera-detail' ? 'active' : ''} type="button" onClick={() => setPage('monitoring')}><MonitorPlay size={18} />User monitoring</button>
         <button className={page === 'dashboard' ? 'active' : ''} type="button" onClick={() => setPage('dashboard')}><Grid2X2 size={18} />Dashboard</button>
         <button className={page === 'lpr-tracking' || page === 'lpr-cycle' ? 'active' : ''} type="button" onClick={() => setPage('lpr-tracking')}><Route size={18} />Lifecycle Tracking</button>
-        <button className={page === 'notifications' ? 'active' : ''} type="button" onClick={() => setPage('notifications')}><Bell size={18} />Notifications {vision.events.length ? <em>{Math.min(99, vision.events.length)}</em> : null}</button>
+        <button className={page === 'notifications' ? 'active' : ''} type="button" onClick={() => setPage('notifications')}><Bell size={18} />Notifications {notificationCount ? <em>{Math.min(99, notificationCount)}</em> : null}</button>
         <span className="nav-label setup-label">SETUP</span>
         {setupNavigation.map((item) => {
           const Icon = item.icon;
-          return <button className={page === item.id || (item.id === 'cameras' && page === 'add-camera') ? 'active' : ''} type="button" key={item.id} onClick={() => setPage(item.id)}><Icon size={18} />{item.label}</button>;
+          return <button className={page === item.id ? 'active' : ''} type="button" key={item.id} onClick={() => setPage(item.id)}><Icon size={18} />{item.label}</button>;
         })}
       </nav>
       <div className="sidebar-footer"><ShieldCheck size={18} /><span><strong>Administrator</strong><small>Full configuration access</small></span></div>
@@ -368,26 +392,78 @@ function CameraWizard({ setPage }: { setPage: (page: Page) => void }) {
   const camera = vision.getCamera();
   const config = camera.configuration;
   const wizardStepStorageKey = `optivision-camera-wizard-step:${camera.id}`;
-  const [step, setStep] = useState(() => {
-    const stored = Number(readStoredString(wizardStepStorageKey));
-    return Number.isInteger(stored) && stored >= 0 && stored < wizardSteps.length ? stored : 0;
+  const initialDraftRef = useRef<ReturnType<typeof readSetupDraft> | null>(null);
+  if (!initialDraftRef.current) initialDraftRef.current = readSetupDraft(camera.id, wizardStepStorageKey, wizardSteps.length - 1);
+  const initialDraft = initialDraftRef.current;
+  const [setupStep, setSetupStep] = useState(initialDraft.currentStep);
+  const [source, setSource] = useState<CameraRecord['sourceType']>(() => {
+    const saved = initialDraft.sourceType as CameraRecord['sourceType'] | undefined;
+    return saved && ['browser', 'uploaded', 'usb', 'http', 'rtsp', 'onvif', 'nvr'].includes(saved) ? saved : camera.sourceType;
   });
-  const [source, setSource] = useState(camera.sourceType);
-  const [externalUrl, setExternalUrl] = useState(camera.sourceUrl);
+  const [externalUrl, setExternalUrl] = useState(initialDraft.externalUrl ?? camera.sourceUrl);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
-  const [activeZoneId, setActiveZoneId] = useState(config.zones[0]?.id ?? '');
-  const [drawMode, setDrawMode] = useState<'zone' | 'line'>('zone');
+  const [activeZoneId, setActiveZoneId] = useState(initialDraft.activeZoneId ?? config.zones[0]?.id ?? '');
+  const [drawMode, setDrawMode] = useState<'zone' | 'line'>(initialDraft.drawMode ?? 'zone');
   const [draftStart, setDraftStart] = useState<{ x: number; y: number } | null>(null);
   const [draftZone, setDraftZone] = useState<Partial<Zone> | null>(null);
   const [draftLine, setDraftLine] = useState<CountingLine | null>(null);
-  const [signalMode, setSignalMode] = useState<'existing' | 'new'>('existing');
-  const [newSignal, setNewSignal] = useState({ name: 'Worker Working', className: 'person', kind: 'object_in_roi' as SignalKind, zoneId: 'operator-zone', holdSeconds: 5 });
+  const [signalMode, setSignalMode] = useState<'existing' | 'new'>(initialDraft.signalMode ?? 'existing');
+  const [newSignal, setNewSignal] = useState(() => ({
+    name: typeof initialDraft.newSignal?.name === 'string' ? initialDraft.newSignal.name : 'Worker Working',
+    className: typeof initialDraft.newSignal?.className === 'string' ? initialDraft.newSignal.className : 'person',
+    kind: (typeof initialDraft.newSignal?.kind === 'string' ? initialDraft.newSignal.kind : 'object_in_roi') as SignalKind,
+    zoneId: typeof initialDraft.newSignal?.zoneId === 'string' ? initialDraft.newSignal.zoneId : 'operator-zone',
+    holdSeconds: typeof initialDraft.newSignal?.holdSeconds === 'number' ? initialDraft.newSignal.holdSeconds : 5
+  }));
   const [saved, setSaved] = useState(false);
+  const [newPlantName, setNewPlantName] = useState('');
+  const selectedPlant = vision.plants.find((plant) => plant.id === vision.selectedPlantId) ?? vision.plants[0];
+  const plantCameras = vision.cameras.filter((item) => item.plantId === selectedPlant?.id);
+  const [desiredCameraCount, setDesiredCameraCount] = useState(() => Math.max(1, plantCameras.length));
+  const remainingCameraSlots = Math.max(0, 7 - vision.cameras.length);
+  const maximumPlantCameraCount = plantCameras.length + remainingCameraSlots;
+  const camerasToCreate = Math.max(0, desiredCameraCount - plantCameras.length);
 
   useEffect(() => {
-    writeStoredString(wizardStepStorageKey, String(step));
-  }, [step, wizardStepStorageKey]);
+    const draftPlantId = initialDraft.selectedPlantId;
+    if (draftPlantId && vision.plants.some((plant) => plant.id === draftPlantId) && draftPlantId !== vision.selectedPlantId) vision.setSelectedPlantId(draftPlantId);
+  }, []);
+
+  useEffect(() => {
+    if (plantCameras.length && !plantCameras.some((item) => item.id === vision.activeCameraId)) vision.setActiveCameraId(plantCameras[0].id);
+  }, [vision.selectedPlantId]);
+
+  useEffect(() => {
+    setDesiredCameraCount(Math.max(1, plantCameras.length));
+  }, [vision.selectedPlantId]);
+
+  useEffect(() => {
+    setSource(camera.sourceType);
+    setExternalUrl(camera.sourceUrl);
+    setActiveZoneId(camera.configuration.zones[0]?.id ?? '');
+    setMessage('');
+  }, [camera.id]);
+
+  useEffect(() => {
+    writeStoredString(wizardStepStorageKey, String(setupStep));
+  }, [setupStep, wizardStepStorageKey]);
+
+  useEffect(() => {
+    writeSetupDraft({
+      flowVersion: 3,
+      cameraId: camera.id,
+      selectedPlantId: vision.selectedPlantId,
+      currentStep: setupStep,
+      sourceType: source,
+      externalUrl,
+      activeZoneId,
+      drawMode,
+      signalMode,
+      newSignal,
+      updatedAt: Date.now()
+    });
+  }, [camera.id, vision.selectedPlantId, setupStep, source, externalUrl, activeZoneId, drawMode, signalMode, newSignal]);
 
   const sourceChoices: Array<{ id: CameraRecord['sourceType']; label: string }> = [
     { id: 'rtsp', label: 'RTSP' }, { id: 'http', label: 'IP Camera' }, { id: 'onvif', label: 'ONVIF' },
@@ -397,6 +473,11 @@ function CameraWizard({ setPage }: { setPage: (page: Page) => void }) {
 
   function updateConfig(update: (current: typeof config) => typeof config) {
     vision.updateConfiguration(camera.id, update);
+  }
+
+  function createSelectedPlantCameras() {
+    if (!selectedPlant || camerasToCreate <= 0) return;
+    vision.addCameras(camerasToCreate, selectedPlant.id, selectedPlant.name);
   }
 
   async function connectSource(file?: File) {
@@ -504,25 +585,62 @@ function CameraWizard({ setPage }: { setPage: (page: Page) => void }) {
     });
   }
 
+  const step = setupStep - 1;
   let content: React.ReactNode;
-  if (step === 0) content = <div className="wizard-content">
-    <div className="section-heading"><div><span className="eyebrow">STEP 1 OF 10</span><h2>Camera source</h2><p>Connect a real camera or video. Each camera keeps its own models, zones, signals, rules, and engine state.</p></div><Pill tone={camera.sourceStatus === 'ready' ? 'green' : 'orange'}>{camera.sourceStatus === 'ready' ? 'Connected' : 'Required'}</Pill></div>
+  if (setupStep === 0) content = <div className="wizard-content plant-first-step">
+    <div className="section-heading"><div><span className="eyebrow">STEP 1 OF 13</span><h2>Select a plant</h2><p>Camera configuration, station mapping, and lifecycle setup will use the selected plant. Switching plants does not stop running cameras.</p></div><Pill tone="orange">Plant first</Pill></div>
+    <div className="plant-choice-grid">{vision.plants.map((plant) => { const count = vision.cameras.filter((item) => item.plantId === plant.id).length; return <button className={vision.selectedPlantId === plant.id ? 'selected' : ''} key={plant.id} onClick={() => { vision.setSelectedPlantId(plant.id); const first = vision.cameras.find((item) => item.plantId === plant.id); if (first) vision.setActiveCameraId(first.id); }} type="button"><span><MapPin size={19} /></span><div><strong>{plant.name}</strong><small>{count} configured camera{count === 1 ? '' : 's'}</small></div>{vision.selectedPlantId === plant.id ? <Check size={17} /> : null}</button>; })}</div>
+    <section className="panel add-plant-inline"><div><strong>Add another plant</strong><small>Create a plant only when cameras belong to a separate site or facility.</small></div><input aria-label="New plant name" value={newPlantName} onChange={(event) => setNewPlantName(event.target.value)} placeholder="Plant name" /><button className="secondary" disabled={!newPlantName.trim()} onClick={() => { const plant = vision.addPlant(newPlantName); vision.setSelectedPlantId(plant.id); setNewPlantName(''); }} type="button"><Plus size={14} />Add plant</button></section>
+  </div>;
+  else if (setupStep === 1) content = <div className="wizard-content">
+    <div className="section-heading"><div><span className="eyebrow">STEP 2 OF 13</span><h2>Cameras in {selectedPlant?.name ?? 'this plant'}</h2><p>Choose how many cameras this plant needs, then configure each camera independently. Every created camera appears in User Monitoring.</p></div><Pill tone="orange">{vision.cameras.length} / 7 total</Pill></div>
+    <section className="panel camera-count-setup"><div><span className="camera-count-icon"><Camera size={19} /></span><span><strong>How many cameras are in {selectedPlant?.name ?? 'this plant'}?</strong><small>The seven-camera limit is shared by all plants. Existing cameras are never removed when this number changes.</small></span></div><div className="camera-count-control"><label htmlFor="plant-camera-count">Camera count</label><input id="plant-camera-count" min={Math.max(1, plantCameras.length)} max={Math.max(1, maximumPlantCameraCount)} type="number" value={desiredCameraCount} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setDesiredCameraCount(Math.max(Math.max(1, plantCameras.length), Math.min(Math.max(1, maximumPlantCameraCount), Math.floor(value)))); }} /><button className="primary" disabled={!camerasToCreate || camerasToCreate > remainingCameraSlots} onClick={createSelectedPlantCameras} type="button">{camerasToCreate ? <><Plus size={15} /> Create {camerasToCreate} camera{camerasToCreate === 1 ? '' : 's'}</> : <><Check size={15} /> Camera count ready</>}</button></div><small className="camera-slot-summary">{remainingCameraSlots ? `${remainingCameraSlots} camera slot${remainingCameraSlots === 1 ? '' : 's'} still available across all plants.` : 'All seven camera slots are currently in use.'}</small></section>
+    {plantCameras.length ? <><div className="camera-selection-heading"><span><strong>Select the camera to configure</strong><small>You can switch cameras here or from the camera bar on every camera setup step.</small></span><small>{plantCameras.length} in {selectedPlant?.name}</small></div><div className="setup-camera-selector">{plantCameras.map((item, index) => <button aria-pressed={item.id === camera.id} className={item.id === camera.id ? 'selected' : ''} key={item.id} onClick={() => vision.setActiveCameraId(item.id)} type="button"><span className="camera-sequence">{index + 1}</span><Camera size={16} /><span><strong>{item.name}</strong><small>{item.sourceStatus === 'ready' ? 'Connected' : item.sourceStatus === 'error' ? 'Needs attention' : 'Not connected'}</small></span>{item.id === camera.id ? <Check size={14} /> : null}</button>)}</div></> : <div className="setup-empty-state"><Camera size={25} /><strong>No cameras in this plant</strong><p>Choose a camera count above and create the cameras to continue.</p></div>}
+    {plantCameras.length ? <>
     <div className="choice-grid source-grid">{sourceChoices.map((item) => <button className={source === item.id ? 'selected' : ''} type="button" key={item.id} onClick={() => { setSource(item.id); vision.updateCamera(camera.id, { sourceType: item.id }); }}><Camera size={20} /><strong>{item.label}</strong><small>{item.id === 'rtsp' ? 'Use an HLS/WebRTC bridge' : 'Available source'}</small>{source === item.id && <Check size={15} />}</button>)}</div>
-    <div className="form-grid"><FormField label="Camera name"><input value={camera.name} onChange={(event) => vision.updateCamera(camera.id, { name: event.target.value })} /></FormField><FormField label="Location"><input value={camera.location} onChange={(event) => vision.updateCamera(camera.id, { location: event.target.value })} /></FormField><FormField label="Department"><input value={camera.department} onChange={(event) => vision.updateCamera(camera.id, { department: event.target.value })} /></FormField><FormField label="Production line"><input value={camera.productionLine} onChange={(event) => vision.updateCamera(camera.id, { productionLine: event.target.value })} /></FormField></div>
+    <div className="form-grid"><FormField label="Camera name"><input value={camera.name} onChange={(event) => vision.updateCamera(camera.id, { name: event.target.value })} /></FormField><FormField label="Plant"><select value={camera.plantId} onChange={(event) => { const plant = vision.plants.find((item) => item.id === event.target.value); if (plant) vision.updateCamera(camera.id, { plantId: plant.id, location: plant.name }); }}>{vision.plants.map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}</select></FormField><FormField label="Department"><input value={camera.department} onChange={(event) => vision.updateCamera(camera.id, { department: event.target.value })} /></FormField><FormField label="Production line"><input value={camera.productionLine} onChange={(event) => vision.updateCamera(camera.id, { productionLine: event.target.value })} /></FormField></div>
     {source === 'uploaded' ? <label className="upload-source"><Upload size={22} /><strong>Select CCTV video</strong><small>MP4, WebM, or another browser-playable recording</small><input accept="video/*" type="file" onChange={(event) => { const file = event.target.files?.[0]; if (file) void connectSource(file); }} /></label> : source === 'browser' || source === 'usb' ? <button className="primary connect-source" disabled={busy === 'connect'} type="button" onClick={() => void connectSource()}><Camera size={16} /> {busy ? 'Connecting…' : `Connect ${source === 'usb' ? 'USB' : 'browser'} camera`}</button> : <div className="external-source"><FormField label="Browser-playable stream URL"><input value={externalUrl} onChange={(event) => setExternalUrl(event.target.value)} placeholder="https://gateway.local/camera-1/index.m3u8" /></FormField><button className="primary" disabled={busy === 'connect'} type="button" onClick={() => void connectSource()}>{busy ? 'Testing…' : 'Connect and test'}</button><small>Raw RTSP cannot play in a browser. Use the HLS, WebRTC, or HTTP URL produced by your gateway/NVR.</small></div>}
     {message || camera.error ? <div className={`inline-status ${camera.sourceStatus === 'ready' ? 'success' : 'info'}`}><span><strong>{camera.sourceStatus === 'ready' ? 'Connection ready' : 'Connection status'}</strong><small>{camera.error || message}</small></span></div> : null}
+    </> : null}
   </div>;
-  else if (step === 1) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 2 OF 10</span><h2>Feed preview</h2><p>Confirm the real feed before drawing zones.</p></div><Pill tone={camera.sourceStatus === 'ready' ? 'green' : 'red'}><i /> {camera.sourceStatus === 'ready' ? 'Connected' : 'Not connected'}</Pill></div><EmptyFeed cameraId={camera.id} /><div className="preview-details"><span><small>Camera</small><strong>{camera.name}</strong></span><span><small>Source</small><strong>{camera.sourceLabel || camera.sourceType}</strong></span><span><small>Engine</small><strong>{vision.workerStatus}</strong></span><button type="button" onClick={() => vision.disconnectCamera(camera.id)}>Disconnect</button></div></div>;
+  else if (step === 1) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 3 OF 13</span><h2>Feed preview</h2><p>Confirm the real feed before drawing zones.</p></div><Pill tone={camera.sourceStatus === 'ready' ? 'green' : 'red'}><i /> {camera.sourceStatus === 'ready' ? 'Connected' : 'Not connected'}</Pill></div><EmptyFeed cameraId={camera.id} /><div className="preview-details"><span><small>Camera</small><strong>{camera.name}</strong></span><span><small>Source</small><strong>{camera.sourceLabel || camera.sourceType}</strong></span><span><small>Engine</small><strong>{vision.workerStatus}</strong></span>{camera.sourceStatus === 'ready' ? <button type="button" onClick={() => vision.disconnectCamera(camera.id)}>Disconnect</button> : <button type="button" onClick={() => setSetupStep(1)}>Reconnect feed</button>}</div></div>;
   else if (step === 2) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 3 OF 10</span><h2>ROI / Zone setup</h2><p>Select a zone, then drag on the feed. Completing the shape activates it automatically for this camera.</p></div><Pill tone="orange">{config.analysisRoiIds.length} active ROI</Pill></div><div className="roi-workspace"><div><div className="drawing-tools"><button className={drawMode === 'zone' ? 'active' : ''} type="button" onClick={() => setDrawMode('zone')}><MousePointer2 size={14} />Rectangle ROI</button><button className={drawMode === 'line' ? 'active' : ''} type="button" onClick={() => setDrawMode('line')}><Waypoints size={14} />Counting line</button></div><EmptyFeed cameraId={camera.id} editor onPointerDown={startDraw} onPointerMove={moveDraw} onPointerUp={finishDraw} draftZone={draftZone} draftLine={draftLine} /></div><aside><span className="eyebrow">CAMERA ZONES</span>{config.zones.map((zone) => <article className={activeZoneId === zone.id ? 'selected' : ''} key={zone.id} onClick={() => { setActiveZoneId(zone.id); setDrawMode('zone'); }}><i style={{ background: zone.color }} /><span><strong>{zone.name}</strong><small>{zone.width > .5 ? `${Math.round(zone.width)} × ${Math.round(zone.height)}% · Active` : 'Select to draw'}</small></span><button type="button"><Edit3 size={14} /></button><button type="button" onClick={(event) => { event.stopPropagation(); updateConfig((current) => ({ ...current, zones: current.zones.map((item) => item.id === zone.id ? { ...item, x: 0, y: 0, width: 0, height: 0 } : item), analysisRoiIds: current.analysisRoiIds.filter((id) => id !== zone.id) })); }}><Trash2 size={14} /></button></article>)}<div className="zone-form"><FormField label="Selected zone"><input value={config.zones.find((zone) => zone.id === activeZoneId)?.name ?? ''} onChange={(event) => updateConfig((current) => ({ ...current, zones: current.zones.map((zone) => zone.id === activeZoneId ? { ...zone, name: event.target.value } : zone) }))} /></FormField><FormField label="Strict overlap"><div className="input-suffix"><input min="10" max="100" type="number" value={Math.round(config.minimumRoiOverlap * 100)} onChange={(event) => updateConfig((current) => ({ ...current, minimumRoiOverlap: Math.max(.1, Math.min(1, Number(event.target.value) / 100)) }))} /><span>%</span></div></FormField></div></aside></div></div>;
-  else if (step === 3) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 4 OF 10</span><h2>Model selection</h2><p>Select actual models exposed by the OptiVision 2 worker.</p></div><Pill tone={vision.workerStatus === 'online' ? 'green' : 'red'}>{vision.workerDetail}</Pill></div><div className="model-table"><div className="model-head"><span>Model</span><span>Task</span><span>Classes</span><span>Installed</span><span>Use</span><span /></div>{vision.models.map((model) => { const selected = config.selectedModelIds.includes(model.id); return <button className={selected ? 'selected' : ''} type="button" key={model.id} onClick={() => updateConfig((current) => ({ ...current, selectedModelIds: selected ? current.selectedModelIds.filter((id) => id !== model.id) : [...current.selectedModelIds, model.id] }))}><span><Cpu size={17} /><b>{model.name}</b><small>{model.id}</small></span><span>{model.task}</span><span>{model.classes.length || 'Custom'}</span><span>{model.installed ? 'Yes' : 'On demand'}</span><span>{model.task === 'pose' ? 'Worker movement' : 'Object detection'}</span><span>{selected ? <Check size={16} /> : 'Select'}</span></button>; })}</div><div className="inline-status info"><Sparkles size={16} /><span><strong>Model isolation</strong><small>These models apply only to {camera.name}. Conveyor direct-motion counting can run without an object model.</small></span><button type="button" onClick={() => void vision.refreshModels()}>Refresh</button></div></div>;
+  else if (step === 3) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 5 OF 13</span><h2>Model selection</h2><p>Select actual models exposed by the OptiVision 2 worker.</p></div><Pill tone={vision.workerStatus === 'online' ? 'green' : 'red'}>{vision.workerDetail}</Pill></div><div className="model-table"><div className="model-head"><span>Model</span><span>Task</span><span>Classes</span><span>Installed</span><span>Use</span><span /></div>{vision.models.map((model) => { const selected = config.selectedModelIds.includes(model.id); return <button className={selected ? 'selected' : ''} type="button" key={model.id} onClick={() => updateConfig((current) => ({ ...current, selectedModelIds: selected ? current.selectedModelIds.filter((id) => id !== model.id) : [...current.selectedModelIds, model.id] }))}><span><Cpu size={17} /><b>{model.name}</b><small>{model.id}</small></span><span>{model.task}</span><span>{model.classes.length || 'Custom'}</span><span>{model.installed ? 'Yes' : 'On demand'}</span><span>{model.task === 'pose' ? 'Worker movement' : 'Object detection'}</span><span>{selected ? <Check size={16} /> : 'Select'}</span></button>; })}</div><div className="inline-status info"><Sparkles size={16} /><span><strong>Model isolation</strong><small>These models apply only to {camera.name}. Conveyor direct-motion counting can run without an object model.</small></span><button type="button" onClick={() => void vision.refreshModels()}>Refresh</button></div></div>;
   else if (step === 4) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 5 OF 10</span><h2>Visual display settings</h2><p>These controls now change the live overlay for this camera.</p></div></div><div className="display-layout"><div className="settings-card"><Switch label="Bounding boxes" value={config.display.boundingBoxes} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, boundingBoxes: value } }))} /><Switch label="Track IDs" value={config.display.trackIds} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, trackIds: value } }))} /><Switch label="Detection labels" value={config.display.labels} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, labels: value } }))} /><Switch label="Confidence values" value={config.display.confidence} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, confidence: value } }))} /><Switch label="Tracking trails" value={config.display.trackingTrails} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, trackingTrails: value } }))} /><Switch label="Zone overlays" value={config.display.zoneOverlays} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, zoneOverlays: value } }))} /><Switch label="Heatmap" value={config.display.heatmap} onChange={(value) => updateConfig((current) => ({ ...current, display: { ...current.display, heatmap: value } }))} /><div className="display-color-row"><span>Detection color</span><input aria-label="Detection color" type="color" value={config.display.detectionColor} onChange={(event) => updateConfig((current) => ({ ...current, display: { ...current.display, detectionColor: event.target.value } }))} /></div><div className="slider-row"><span>Bounding box thickness</span><input type="range" min="1" max="8" value={config.display.boxThickness} onChange={(event) => updateConfig((current) => ({ ...current, display: { ...current.display, boxThickness: Number(event.target.value) } }))} /></div></div><EmptyFeed cameraId={camera.id} compact /></div></div>;
-  else if (step === 5) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 6 OF 10</span><h2>Detection signals</h2><p>Choose from the complete shared signal library or create a camera-specific signal.</p></div><Pill tone="orange">{config.signals.length} configured</Pill></div><div className="segmented"><button className={signalMode === 'existing' ? 'active' : ''} type="button" onClick={() => setSignalMode('existing')}>Signal templates ({signalTemplates.length})</button><button className={signalMode === 'new' ? 'active' : ''} type="button" onClick={() => setSignalMode('new')}>Create manually</button></div>{signalMode === 'existing' ? <div className="signal-library">{signalTemplates.map((signal) => { const selected = config.signals.some((item) => item.id === signal.id || item.name === signal.name); return <label key={signal.id}><input type="checkbox" checked={selected} onChange={(event) => setTemplateEnabled(signal, event.currentTarget.checked)} /><span><Activity size={15} /><strong>{signal.name}</strong><small>{signal.kind.replaceAll('_', ' ')}</small></span></label>; })}</div> : <div className="builder-card"><div className="form-grid"><FormField label="Signal name"><input value={newSignal.name} onChange={(event) => setNewSignal({ ...newSignal, name: event.target.value })} /></FormField><FormField label="Object class"><input value={newSignal.className} onChange={(event) => setNewSignal({ ...newSignal, className: event.target.value })} /></FormField><FormField label="Signal kind"><select value={newSignal.kind} onChange={(event) => setNewSignal({ ...newSignal, kind: event.target.value as SignalKind })}>{['object_detected','object_in_roi','object_absent_from_roi','object_count','object_entered_roi','line_crossing_count','objects_near','pose_moving','zone_motion','zone_idle','line_crossing_rate','roi_color_match','object_orientation_match','object_size_check'].map((kind) => <option key={kind} value={kind}>{kind.replaceAll('_',' ')}</option>)}</select></FormField><FormField label="Zone"><select value={newSignal.zoneId} onChange={(event) => setNewSignal({ ...newSignal, zoneId: event.target.value })}><option value="">Full frame</option>{config.zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></FormField><FormField label="Hold duration"><div className="input-suffix"><input min="0" type="number" value={newSignal.holdSeconds} onChange={(event) => setNewSignal({ ...newSignal, holdSeconds: Number(event.target.value) })} /><span>seconds</span></div></FormField></div><button className="primary" type="button" onClick={saveNewSignal}><Save size={15} /> Save signal</button></div>}</div>;
-  else if (step === 6) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 7 OF 10</span><h2>Detection rules</h2><p>Use the complete shared rule library or edit this camera's selected rules.</p></div><button className="secondary" type="button" onClick={addRule}><Plus size={15} /> Create manually</button></div><div className="rule-card-list">{config.rules.map((rule) => <article className="builder-card" key={rule.id}><div className="rule-editor-head"><input value={rule.name} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, name: event.target.value } : item) }))} /><Pill tone={vision.frames[camera.id]?.rules.find((item) => item.ruleId === rule.id)?.active ? 'green' : 'neutral'}>{vision.frames[camera.id]?.rules.find((item) => item.ruleId === rule.id)?.active ? 'TRUE' : 'FALSE'}</Pill><button title="Delete rule" type="button" onClick={() => updateConfig((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) }))}><Trash2 size={14} /></button></div><div className="condition-row"><select value={rule.conditions[0]?.signalId} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, conditions: [{ ...(item.conditions[0] ?? { id: `condition-${Date.now()}`, operator: 'IS_ACTIVE' }), signalId: event.target.value }] } : item) }))}>{config.signals.map((signal) => <option key={signal.id} value={signal.id}>{signal.name}</option>)}</select><select value={rule.conditions[0]?.operator} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, conditions: [{ ...item.conditions[0], operator: event.target.value as RuleDefinition['conditions'][number]['operator'] }] } : item) }))}><option value="IS_ACTIVE">is active</option><option value="IS_NOT_ACTIVE">is not active</option><option value="GREATER_THAN">greater than</option><option value="LESS_THAN">less than</option><option value="EQUALS">equals</option><option value="STATE_CHANGE">state changed</option></select><input aria-label="Rule duration seconds" min="0" type="number" value={rule.forSeconds} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, forSeconds: Number(event.target.value) } : item) }))} /></div><small>THEN output <strong>{rule.output}</strong> after {rule.forSeconds}s</small></article>)}</div><div className="available-rule-library"><div className="section-heading"><div><h3>Available rule templates</h3><p>{builtInRuleTemplates.length} worker, machine, counting and safety rules.</p></div></div><div className="template-catalog">{builtInRuleTemplates.map((template) => { const added = config.rules.some((rule) => rule.id === template.id || rule.name === template.name); return <article key={template.id}><span><small>{template.category}</small><strong>{template.name}</strong><p>{template.description}</p></span><button className="secondary" disabled={added} type="button" onClick={() => addRuleTemplate(template)}>{added ? 'Added' : 'Add'}</button></article>; })}</div></div><div className="inline-status info"><Play size={16} /><span><strong>Live engine test</strong><small>Connect the feed, draw an ROI, then start this camera from Monitoring or the final step.</small></span></div></div>;
-  else if (step === 7) content = <BusinessRuleSetup cameraId={camera.id} />;
-  else if (step === 8) content = <LegacyAutomationStep />;
-  else content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 10 OF 10</span><h2>Review and save</h2><p>The actual per-camera engine configuration is already stored locally and ready for testing.</p></div><Pill tone={saved ? 'green' : 'orange'}>{saved ? 'Saved' : 'Ready'}</Pill></div><div className="review-grid">{[['Camera', camera.name, `${camera.sourceStatus} · ${camera.sourceType}`], ['Models', String(config.selectedModelIds.length), config.selectedModelIds.join(' · ') || 'Direct-motion mode'], ['Zones', String(config.analysisRoiIds.length), config.zones.filter((zone) => zone.width > .5).map((zone) => zone.name).join(' · ') || 'Draw zones first'], ['Signals', String(config.signals.length), 'Reusable per-camera signal definitions'], ['Detection rules', String(config.rules.length), 'Evaluated by the OptiVision 2 worker'], ['Engine', vision.workerStatus, vision.workerDetail]].map(([label, value, detail], index) => <article key={label}><span>{index + 1}</span><div><small>{label}</small><strong>{value}</strong><p>{detail}</p></div></article>)}</div><div className="save-actions"><button className="primary large" type="button" onClick={() => setSaved(true)}><Save size={17} /> Save configuration</button><button className="secondary large" type="button" onClick={() => void vision.toggleEngine(camera.id)}>{vision.running[camera.id] ? <Pause size={16} /> : <Play size={16} />}{vision.running[camera.id] ? 'Pause this camera' : 'Start this camera'}</button></div>{camera.error ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Engine requirement</strong><small>{camera.error}</small></span></div> : null}</div>;
+  else if (setupStep === 6) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 7 OF 13</span><h2>User monitoring parameters</h2><p>Choose what operators should see on this camera card, including Workers working, Productivity, output, machine status, configured signals, and business values.</p></div></div><MonitoringMetricSetup cameraId={camera.id} /></div>;
+  else if (setupStep === 7) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 8 OF 13</span><h2>Detection signals</h2><p>Choose from the complete shared signal library or create a camera-specific signal.</p></div><Pill tone="orange">{config.signals.length} configured</Pill></div><div className="segmented"><button className={signalMode === 'existing' ? 'active' : ''} type="button" onClick={() => setSignalMode('existing')}>Signal templates ({signalTemplates.length})</button><button className={signalMode === 'new' ? 'active' : ''} type="button" onClick={() => setSignalMode('new')}>Create manually</button></div>{signalMode === 'existing' ? <div className="signal-library">{signalTemplates.map((signal) => { const selected = config.signals.some((item) => item.id === signal.id || item.name === signal.name); return <label key={signal.id}><input type="checkbox" checked={selected} onChange={(event) => setTemplateEnabled(signal, event.currentTarget.checked)} /><span><Activity size={15} /><strong>{signal.name}</strong><small>{signal.kind.replaceAll('_', ' ')}</small></span></label>; })}</div> : <div className="builder-card"><div className="form-grid"><FormField label="Signal name"><input value={newSignal.name} onChange={(event) => setNewSignal({ ...newSignal, name: event.target.value })} /></FormField><FormField label="Object class"><input value={newSignal.className} onChange={(event) => setNewSignal({ ...newSignal, className: event.target.value })} /></FormField><FormField label="Signal kind"><select value={newSignal.kind} onChange={(event) => setNewSignal({ ...newSignal, kind: event.target.value as SignalKind })}>{['object_detected','object_in_roi','object_absent_from_roi','object_count','object_entered_roi','line_crossing_count','objects_near','pose_moving','zone_motion','zone_idle','line_crossing_rate','roi_color_match','object_orientation_match','object_size_check'].map((kind) => <option key={kind} value={kind}>{kind.replaceAll('_',' ')}</option>)}</select></FormField><FormField label="Zone"><select value={newSignal.zoneId} onChange={(event) => setNewSignal({ ...newSignal, zoneId: event.target.value })}><option value="">Full frame</option>{config.zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></FormField><FormField label="Hold duration"><div className="input-suffix"><input min="0" type="number" value={newSignal.holdSeconds} onChange={(event) => setNewSignal({ ...newSignal, holdSeconds: Number(event.target.value) })} /><span>seconds</span></div></FormField></div><button className="primary" type="button" onClick={saveNewSignal}><Save size={15} /> Save signal</button></div>}</div>;
+  else if (setupStep === 8) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 9 OF 13</span><h2>Detection rules</h2><p>Use the complete shared rule library or edit this camera's selected rules.</p></div><button className="secondary" type="button" onClick={addRule}><Plus size={15} /> Create manually</button></div><div className="rule-card-list">{config.rules.map((rule) => <article className="builder-card" key={rule.id}><div className="rule-editor-head"><input value={rule.name} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, name: event.target.value } : item) }))} /><Pill tone={vision.frames[camera.id]?.rules.find((item) => item.ruleId === rule.id)?.active ? 'green' : 'neutral'}>{vision.frames[camera.id]?.rules.find((item) => item.ruleId === rule.id)?.active ? 'TRUE' : 'FALSE'}</Pill><button title="Delete rule" type="button" onClick={() => updateConfig((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) }))}><Trash2 size={14} /></button></div><div className="condition-row"><select value={rule.conditions[0]?.signalId} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, conditions: [{ ...(item.conditions[0] ?? { id: `condition-${Date.now()}`, operator: 'IS_ACTIVE' }), signalId: event.target.value }] } : item) }))}>{config.signals.map((signal) => <option key={signal.id} value={signal.id}>{signal.name}</option>)}</select><select value={rule.conditions[0]?.operator} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, conditions: [{ ...item.conditions[0], operator: event.target.value as RuleDefinition['conditions'][number]['operator'] }] } : item) }))}><option value="IS_ACTIVE">is active</option><option value="IS_NOT_ACTIVE">is not active</option><option value="GREATER_THAN">greater than</option><option value="LESS_THAN">less than</option><option value="EQUALS">equals</option><option value="STATE_CHANGE">state changed</option></select><input aria-label="Rule duration seconds" min="0" type="number" value={rule.forSeconds} onChange={(event) => updateConfig((current) => ({ ...current, rules: current.rules.map((item) => item.id === rule.id ? { ...item, forSeconds: Number(event.target.value) } : item) }))} /></div><small>THEN output <strong>{rule.output}</strong> after {rule.forSeconds}s</small></article>)}</div><div className="available-rule-library"><div className="section-heading"><div><h3>Available rule templates</h3><p>{builtInRuleTemplates.length} worker, machine, counting and safety rules.</p></div></div><div className="template-catalog">{builtInRuleTemplates.map((template) => { const added = config.rules.some((rule) => rule.id === template.id || rule.name === template.name); return <article key={template.id}><span><small>{template.category}</small><strong>{template.name}</strong><p>{template.description}</p></span><button className="secondary" disabled={added} type="button" onClick={() => addRuleTemplate(template)}>{added ? 'Added' : 'Add'}</button></article>; })}</div></div><div className="inline-status info"><Play size={16} /><span><strong>Live engine test</strong><small>Connect the feed, draw an ROI, then start this camera from Monitoring or the final step.</small></span></div></div>;
+  else if (setupStep === 9) content = <BusinessRuleSetup cameraId={camera.id} />;
+  else if (setupStep === 10) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 11 OF 13</span><h2>Station mapping</h2><p>Define the lifecycle journey for the selected plant while preserving every existing station identity.</p></div></div><LifecycleStationSetup plantId={vision.selectedPlantId} /></div>;
+  else if (setupStep === 11) content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 12 OF 13</span><h2>Automations</h2><p>Lifecycle notifications use configured station IDs. General rule automations remain separate below.</p></div></div><LifecycleAutomationSetup /><section className="panel general-automation-callout"><div><span>General and business-rule automations</span><p>Detection and business-rule alerts are managed separately and do not share lifecycle station triggers.</p></div><button className="secondary" type="button" onClick={() => setPage('automations')}>Open general automations <ArrowRight size={14} /></button></section></div>;
+  else content = <div className="wizard-content"><div className="section-heading"><div><span className="eyebrow">STEP 13 OF 13</span><h2>Review and save</h2><p>The actual per-camera engine configuration is already stored locally and ready for testing.</p></div><Pill tone={saved ? 'green' : 'orange'}>{saved ? 'Saved' : 'Ready'}</Pill></div><div className="review-grid">{[['Camera', camera.name, `${camera.sourceStatus} · ${camera.sourceType}`], ['Models', String(config.selectedModelIds.length), config.selectedModelIds.join(' · ') || 'Direct-motion mode'], ['Zones', String(config.analysisRoiIds.length), config.zones.filter((zone) => zone.width > .5).map((zone) => zone.name).join(' · ') || 'Draw zones first'], ['Monitoring metrics', String(config.monitoringMetrics.length), config.monitoringMetrics.map((metric) => metric.label).join(' · ') || 'None selected'], ['Signals', String(config.signals.length), 'Reusable per-camera signal definitions'], ['Detection rules', String(config.rules.length), 'Evaluated by the OptiVision 2 worker'], ['Engine', vision.workerStatus, vision.workerDetail]].map(([label, value, detail], index) => <article key={label}><span>{index + 1}</span><div><small>{label}</small><strong>{value}</strong><p>{detail}</p></div></article>)}</div><div className="save-actions"><button className="primary large" type="button" onClick={() => setSaved(true)}><Save size={17} /> Save configuration</button><button className="secondary large" type="button" onClick={() => void vision.toggleEngine(camera.id)}>{vision.running[camera.id] ? <Pause size={16} /> : <Play size={16} />}{vision.running[camera.id] ? 'Pause this camera' : 'Start this camera'}</button>{plantCameras.length > 1 ? <button className="secondary large" type="button" onClick={() => { const currentIndex = plantCameras.findIndex((item) => item.id === camera.id); const nextCamera = plantCameras[(currentIndex + 1) % plantCameras.length]; vision.setActiveCameraId(nextCamera.id); setSaved(false); setSetupStep(1); }}><Camera size={16} /> Configure next camera</button> : null}</div>{camera.error ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Engine requirement</strong><small>{camera.error}</small></span></div> : null}</div>;
 
-  return <div className="wizard-page"><button className="back-link" type="button" onClick={() => setPage('cameras')}><ArrowLeft size={15} /> Cameras</button><div className="wizard-stepper">{wizardSteps.map((label, index) => <button className={step === index ? 'active' : step > index ? 'complete' : ''} type="button" key={label} onClick={() => setStep(index)}><span>{step > index ? <Check size={13} /> : index + 1}</span><small>{label}</small></button>)}</div><section className="panel wizard-shell">{content}<footer className="wizard-footer"><button className="secondary" type="button" disabled={step === 0} onClick={() => setStep(step - 1)}><ArrowLeft size={15} /> Back</button><span>Step {step + 1} of {wizardSteps.length}</span>{step < wizardSteps.length - 1 ? <button className="primary" type="button" onClick={() => setStep(step + 1)}>Continue <ArrowRight size={15} /></button> : <button className="secondary" type="button" onClick={() => setPage('monitoring')}>Open monitoring</button>}</footer></section></div>;
+  const showCameraSwitcher = plantCameras.length > 1 && setupStep >= 1 && setupStep <= 9;
+  return <div className="wizard-page"><button className="back-link" type="button" onClick={() => setPage('cameras')}><ArrowLeft size={15} /> Cameras</button><div className="wizard-stepper">{wizardSteps.map((label, index) => <button className={setupStep === index ? 'active' : setupStep > index ? 'complete' : ''} type="button" key={label} onClick={() => setSetupStep(index)}><span>{setupStep > index ? <Check size={13} /> : index + 1}</span><small>{label}</small></button>)}</div><section className="panel wizard-shell" data-step={setupStep + 1}>{showCameraSwitcher ? <nav aria-label="Camera being configured" className="camera-setup-switcher"><span><Camera size={16} /><small>Configuring camera</small></span><div>{plantCameras.map((item, index) => <button aria-current={item.id === camera.id ? 'true' : undefined} className={item.id === camera.id ? 'active' : ''} key={item.id} onClick={() => vision.setActiveCameraId(item.id)} type="button"><b>{index + 1}</b>{item.name}{item.id === camera.id ? <Check size={13} /> : null}</button>)}</div></nav> : null}{content}<footer className="wizard-footer"><button className="secondary" type="button" disabled={setupStep === 0} onClick={() => setSetupStep(setupStep - 1)}><ArrowLeft size={15} /> Back</button><span>Step {setupStep + 1} of {wizardSteps.length}</span>{setupStep < wizardSteps.length - 1 ? <button className="primary" disabled={setupStep === 1 && !plantCameras.length} type="button" onClick={() => setSetupStep(setupStep + 1)}>Continue <ArrowRight size={15} /></button> : <button className="secondary" type="button" onClick={() => setPage('monitoring')}>Open monitoring</button>}</footer></section></div>;
+}
+
+function MonitoringMetricSetup({ cameraId }: { cameraId: string }) {
+  const vision = useVision();
+  const camera = vision.getCamera(cameraId);
+  const selected = camera.configuration.monitoringMetrics;
+  const options = ([
+    { id: 'worker-present', label: 'Worker present', source: 'system', sourceId: 'worker_present', format: 'number' },
+    { id: 'workers-working', label: 'Workers working', source: 'system', sourceId: 'workers_working', format: 'number' },
+    { id: 'workers-idle', label: 'Workers idle', source: 'system', sourceId: 'workers_idle', format: 'number' },
+    { id: 'output-count', label: 'Output count', source: 'system', sourceId: 'output_count', format: 'number' },
+    { id: 'productivity', label: 'Productivity', source: 'system', sourceId: 'productivity', format: 'percent' },
+    { id: 'machine-status', label: 'Machine status', source: 'system', sourceId: 'machine_status', format: 'status' },
+    ...camera.configuration.signals.map((signal) => ({ id: `signal:${signal.id}`, label: signal.name, source: 'signal' as const, sourceId: signal.id, format: signal.kind.includes('count') || signal.kind.includes('rate') ? 'number' as const : 'status' as const })),
+    ...camera.configuration.rules.map((rule) => ({ id: `rule:${rule.id}`, label: rule.name, source: 'rule' as const, sourceId: rule.id, format: 'status' as const })),
+    ...camera.configuration.businessRules.map((rule) => ({ id: `business:${rule.id}`, label: rule.name, source: 'business' as const, sourceId: rule.id, format: rule.unit === 'percent' ? 'percent' as const : rule.unit === 'duration' ? 'duration' as const : 'number' as const }))
+  ] satisfies CameraCardMetric[]).filter((option, index, all) => all.findIndex((item) => item.id === option.id) === index);
+  const toggle = (metric: CameraCardMetric) => vision.updateConfiguration(cameraId, (current) => ({
+    ...current,
+    monitoringMetrics: current.monitoringMetrics.some((item) => item.id === metric.id)
+      ? current.monitoringMetrics.filter((item) => item.id !== metric.id)
+      : [...current.monitoringMetrics, metric]
+  }));
+  return <section className="monitoring-metric-setup panel"><div className="section-heading"><div><h3>User monitoring parameters</h3><p>Select the fields that should appear on this camera in User Monitoring. These choices are saved separately for each camera.</p></div><Pill tone="orange">{selected.length} shown</Pill></div><div className="metric-choice-grid">{options.map((metric) => { const active = selected.some((item) => item.id === metric.id); return <button className={active ? 'selected' : ''} type="button" key={metric.id} onClick={() => toggle(metric)}><span><strong>{metric.label}</strong><small>{metric.source} · {metric.format}</small></span>{active ? <Check size={15} /> : <Plus size={15} />}</button>; })}</div>{selected.length === 0 ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>No parameters selected</strong><small>This camera card will show a prompt to choose parameters instead of fixed placeholder values.</small></span></div> : null}</section>;
 }
 
 const businessMetricLabels: Record<BusinessMetricKey, string> = {
@@ -916,7 +1034,82 @@ function LegacyMonitoringPage({ setPage }: { setPage: (page: Page) => void }) {
   return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">USER MONITORING</span><h2>Live camera operations</h2><p>See only configured intelligence and the values that matter for each camera.</p></div><div className="page-controls"><select defaultValue="all"><option value="all">All cameras</option><option>Plant A</option><option>Plant B</option></select><select value={grid} onChange={(event) => setGrid(event.target.value)}><option value="1">1 camera</option><option value="2">2 cameras</option><option value="3">3 cameras</option></select></div></div><section className={`monitor-grid columns-${grid}`}>{cameraCards.map((camera, index) => <button className="monitor-card" type="button" key={camera.name} onClick={() => setPage('camera-detail')}><div className="monitor-feed"><EmptyFeed compact /><span className={`camera-status ${index === 2 ? 'stopped' : ''}`}><i /> {camera.status}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{camera.name}</strong><small>{camera.location}</small></span><ChevronRight size={18} /></div><div className="camera-parameters"><span><small>Worker present</small><strong>{camera.workers}</strong></span><span><small>Workers working</small><strong>{camera.working}</strong></span><span><small>Workers idle</small><strong>{camera.idle}</strong></span><span><small>Output count</small><strong>{camera.output}</strong></span><span><small>Productivity</small><strong>{camera.productivity}%</strong></span><span><small>Machine status</small><strong className={index === 2 ? 'danger-text' : 'success-text'}>{camera.status.toUpperCase()}</strong></span></div></button>)}</section></div>;
 }
 
+function ConfiguredMetricGrid({ cameraId, onConfigure }: { cameraId: string; onConfigure: () => void }) {
+  const vision = useVision();
+  const camera = vision.getCamera(cameraId);
+  const frame = vision.frames[cameraId];
+  const session = vision.metrics[cameraId];
+  const people = frame?.detections.filter((detection) => detection.className === 'person').length ?? 0;
+  const observed = (session?.activeSeconds ?? 0) + (session?.idleSeconds ?? 0) + (session?.absentSeconds ?? 0);
+  const counter = frame?.signals.find((signal) => signal.kind === 'line_crossing_count');
+  const machineStopped = frame?.signals.some((signal) => signal.signalId === 'machine-idle' && signal.active) ?? false;
+  const metrics = camera.configuration.monitoringMetrics;
+  function value(metric: CameraCardMetric) {
+    if (metric.id === 'worker-present') return String(people);
+    if (metric.id === 'workers-working') return String(frame?.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active) ? people : 0);
+    if (metric.id === 'workers-idle') return String(frame?.rules.some((rule) => rule.output === 'WORKER_IDLE' && rule.active) ? people : 0);
+    if (metric.id === 'output-count') return String(Number(counter?.evidence.totalCount ?? counter?.value ?? 0));
+    if (metric.id === 'productivity') return `${observed ? Math.round((session?.activeSeconds ?? 0) / observed * 100) : 0}%`;
+    if (metric.id === 'machine-status') return machineStopped ? 'STOPPED' : frame ? 'RUNNING' : 'WAITING';
+    if (metric.source === 'signal') {
+      const state = frame?.signals.find((item) => item.signalId === metric.sourceId);
+      return metric.format === 'status' ? (state?.active ? 'ACTIVE' : 'INACTIVE') : String(Number(state?.value ?? 0));
+    }
+    if (metric.source === 'rule') return frame?.rules.find((item) => item.ruleId === metric.sourceId)?.active ? 'TRUE' : 'FALSE';
+    if (metric.source === 'business') {
+      const rule = camera.configuration.businessRules.find((item) => item.id === metric.sourceId);
+      if (!rule) return '—';
+      return formatBusinessResult(rule, businessRuleResult(rule, vision, cameraId));
+    }
+    return '—';
+  }
+  return <section className="configured-parameters"><header><span><strong>User parameters</strong><small>{metrics.length ? `${metrics.length} selected for this camera` : 'Nothing selected yet'}</small></span><button type="button" onClick={onConfigure}><Settings2 size={13} /> Choose parameters</button></header>{metrics.length ? <div className="camera-parameters">{metrics.map((metric) => <span key={metric.id}><small>{metric.label}</small><strong className={metric.sourceId === 'machine_status' ? machineStopped ? 'danger-text' : 'success-text' : ''}>{value(metric)}</strong></span>)}</div> : <div className="camera-parameters-empty"><Gauge size={19} /><span><strong>No monitoring parameters</strong><small>Choose Workers working, Productivity, or another configured value.</small></span></div>}</section>;
+}
+
+function MonitoringCameraCard({ camera, setPage, onError }: { camera: CameraRecord; setPage: (page: Page) => void; onError: (message: string) => void }) {
+  const vision = useVision();
+  const lpr = useLpr();
+  const [actionError, setActionError] = useState('');
+  const cameraName = camera.name.trim() || camera.id;
+  const frame = vision.frames[camera.id];
+  const machineStopped = frame?.signals.some((signal) => signal.signalId === 'machine-idle' && signal.active);
+  const assignment = lpr.processes.flatMap((process) => process.stages.map((stage) => ({ process, stage }))).find((item) => item.stage.cameraId === camera.id);
+  async function toggle() { onError(''); setActionError(''); try { await vision.toggleEngine(camera.id); } catch (error) { const message = error instanceof Error ? error.message : 'Could not start the camera.'; setActionError(message); onError(message); } }
+  function openSourceSetup() {
+    const legacyStepKey = `optivision-camera-wizard-step:${camera.id}`;
+    const draft = readSetupDraft(camera.id, legacyStepKey, wizardSteps.length - 1);
+    writeSetupDraft({ ...draft, selectedPlantId: camera.plantId, currentStep: 1, updatedAt: Date.now() });
+    vision.setSelectedPlantId(camera.plantId);
+    vision.setActiveCameraId(camera.id);
+    setPage('add-camera');
+  }
+  function openParameterSetup() {
+    const legacyStepKey = `optivision-camera-wizard-step:${camera.id}`;
+    const draft = readSetupDraft(camera.id, legacyStepKey, wizardSteps.length - 1);
+    writeSetupDraft({ ...draft, selectedPlantId: camera.plantId, currentStep: 6, updatedAt: Date.now() });
+    vision.setSelectedPlantId(camera.plantId);
+    vision.setActiveCameraId(camera.id);
+    setPage('add-camera');
+  }
+  const sourceReady = camera.sourceStatus === 'ready';
+  const statusLabel = vision.running[camera.id] && vision.workerStatus !== 'online' ? 'Worker offline' : vision.running[camera.id] ? 'Detecting' : sourceReady ? 'Paused' : camera.sourceStatus === 'error' ? 'Source missing' : 'Not connected';
+  return <article className="monitor-card live-card"><button className="monitor-open" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('camera-detail'); }}><div className="monitor-feed"><EmptyFeed compact cameraId={camera.id} /><span className={`camera-status ${!sourceReady || machineStopped ? 'stopped' : ''}`}><i />{statusLabel}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{cameraName}</strong><small>{camera.location} · {camera.department}</small><em><Route size={12} />{assignment ? `${assignment.stage.name} · ${assignment.process.name}` : 'No station mapping'}</em></span><ChevronRight size={18} /></div></button><ConfiguredMetricGrid cameraId={camera.id} onConfigure={openParameterSetup} /><footer className="monitor-controls"><button className="secondary" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('add-camera'); }}><Settings2 size={14} />Configure</button>{sourceReady ? <button className={vision.running[camera.id] ? 'secondary' : 'primary'} type="button" onClick={() => void toggle()}>{vision.running[camera.id] ? <Pause size={14} /> : <Play size={14} />}{vision.running[camera.id] ? 'Pause engine' : 'Start engine'}</button> : <button className="primary" type="button" onClick={openSourceSetup}><Upload size={14} />Connect feed</button>}</footer>{actionError || camera.error ? <p className="camera-error-copy" role="alert">{actionError || camera.error}</p> : null}</article>;
+}
+
 function MonitoringPage({ setPage }: { setPage: (page: Page) => void }) {
+  const vision = useVision();
+  const lpr = useLpr();
+  const [grid, setGrid] = useState(() => readStoredString('optivision-monitor-grid-v1', '3'));
+  const [error, setError] = useState('');
+  useEffect(() => { writeStoredString('optivision-monitor-grid-v1', grid); }, [grid]);
+  const plantCameras = vision.cameras.filter((camera) => camera.plantId === vision.selectedPlantId);
+  const mappedCameraIds = new Set(lpr.processes.flatMap((process) => process.stages.filter((stage) => stage.cameraId).map((stage) => stage.cameraId)));
+  const readyCount = plantCameras.filter((camera) => camera.sourceStatus === 'ready').length;
+  const runningCount = plantCameras.filter((camera) => vision.running[camera.id]).length;
+  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">USER MONITORING</span><h2>Live camera operations</h2><p>Review every configured camera in the selected plant. Select a camera image to open its full preview.</p></div><div className="page-controls"><select aria-label="Plant" value={vision.selectedPlantId} onChange={(event) => vision.setSelectedPlantId(event.target.value)}>{vision.plants.map((plant) => <option value={plant.id} key={plant.id}>{plant.name}</option>)}</select><select aria-label="Camera grid columns" value={grid} onChange={(event) => setGrid(event.target.value)}><option value="1">1 column</option><option value="2">2 columns</option><option value="3">3 columns</option></select></div></div><section className="monitor-summary panel"><div><small>Configured</small><strong>{plantCameras.length}</strong><span>in selected plant</span></div><div><small>Connected</small><strong>{readyCount}</strong><span>feeds ready</span></div><div><small>Monitoring</small><strong>{runningCount}</strong><span>engines active</span></div><div><small>Station mapped</small><strong>{plantCameras.filter((camera) => mappedCameraIds.has(camera.id)).length}</strong><span>LPR checkpoints</span></div></section>{error ? <div className="training-notice error"><AlertTriangle size={16} />{error}</div> : null}{plantCameras.length ? <section className={`monitor-grid columns-${grid}`}>{plantCameras.map((camera) => <MonitoringCameraCard camera={camera} key={camera.id} onError={setError} setPage={setPage} />)}</section> : <section className="panel setup-empty-state"><Camera size={28} /><strong>No cameras in this plant</strong><p>Open Setup to add or assign a camera.</p><button className="primary" type="button" onClick={() => setPage('add-camera')}>Open setup</button></section>}</div>;
+}
+
+function MonitoringPageLegacy({ setPage }: { setPage: (page: Page) => void }) {
   const vision = useVision();
   const lpr = useLpr();
   const [grid, setGrid] = useState(() => readStoredString('optivision-monitor-grid-v1', '3'));
@@ -979,12 +1172,24 @@ function DashboardPage() {
 function NotificationsPage({ setPage }: { setPage: (page: Page) => void }) {
   const vision = useVision();
   const [readBefore, setReadBefore] = useState(0);
-  const visibleEvents = vision.events.filter((event) => event.timestamp > readBefore);
-  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">NOTIFICATION CENTER</span><h2>Operational notifications</h2><p>Live signal transitions, rule outputs, conveyor counts, and engine errors stay linked to their camera.</p></div><button className="secondary" disabled={!visibleEvents.length} type="button" onClick={() => setReadBefore(Date.now() / 1000)}>Mark all as read</button></div><section className="panel notifications-list">{visibleEvents.map((event) => {
+  const visibleEvents = distinctNotificationEvents(vision.events.filter((event) => event.timestamp > readBefore));
+  return <div className="page-stack"><div className="page-title"><div><span className="eyebrow">NOTIFICATION CENTER</span><h2>Operational notifications</h2><p>Live signal transitions, rule outputs, conveyor counts, and engine errors stay linked to their camera.</p></div><button className="secondary" disabled={!visibleEvents.length} type="button" onClick={() => setReadBefore(Date.now() / 1000)}>Mark all as read</button></div>{vision.workerStatus === 'offline' ? <div className="training-notice error"><AlertTriangle size={16} /><span><strong>Python analysis worker is offline</strong><small>The repeated “Failed to fetch” entries were connection attempts to the unavailable worker. New analysis requests are paused until it is online again.</small></span></div> : null}<section className="panel notifications-list">{visibleEvents.map((event) => {
     const tone = event.type === 'error' ? 'critical' : event.type === 'count' ? 'success' : 'warning';
     const camera = vision.getCamera(event.cameraId);
     return <button type="button" key={event.id} onClick={() => { vision.setActiveCameraId(event.cameraId); setPage('camera-detail'); }}><span className={`notification-icon ${tone}`}>{tone === 'critical' ? <AlertTriangle size={19} /> : tone === 'warning' ? <TimerReset size={19} /> : <Check size={19} />}</span><span><strong>{event.title}</strong><p>{camera.name} · {event.detail}</p><small>{new Date(event.timestamp * 1000).toLocaleString()}</small></span><ChevronRight size={17} /></button>;
   })}{!visibleEvents.length ? <div className="notifications-empty"><Bell size={28} /><strong>No unread operational notifications</strong><p>Start a camera engine to evaluate its signals and rules.</p></div> : null}</section></div>;
+}
+
+function LegacyLifecycleSetupRedirect({ setPage }: { setPage: (page: Page) => void }) {
+  const vision = useVision();
+  useEffect(() => {
+    const camera = vision.getCamera();
+    const legacyStepKey = `optivision-camera-wizard-step:${camera.id}`;
+    const draft = readSetupDraft(camera.id, legacyStepKey, wizardSteps.length - 1);
+    writeSetupDraft({ ...draft, selectedPlantId: vision.selectedPlantId, currentStep: 10, updatedAt: Date.now() });
+    setPage('add-camera');
+  }, []);
+  return <section className="panel setup-empty-state"><Route size={26} /><strong>Opening lifecycle setup</strong><p>Your saved station configuration is being opened in the unified Setup flow.</p></section>;
 }
 
 export function App() {
@@ -1003,10 +1208,10 @@ export function App() {
     if (page === 'training') return <TrainingPage />;
     if (page === 'camera-detail') return <CameraDetail setPage={setPage} />;
     if (page === 'dashboard') return <DashboardPage />;
-    if (page === 'lpr-cycle') return <LprTrackingPage initialSection="mapping" />;
+    if (page === 'lpr-cycle') return <LegacyLifecycleSetupRedirect setPage={setPage} />;
     if (page === 'lpr-tracking') return <LprTrackingPage />;
     if (page === 'notifications') return <NotificationsPage setPage={setPage} />;
     return <MonitoringPage setPage={setPage} />;
   }, [page]);
-  return <div className="app-shell"><Sidebar page={page} setPage={(next) => { setPage(next); setSidebarOpen(false); }} open={sidebarOpen} /><div className="workspace"><AppHeader page={page} setPage={setPage} sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen} /><main className="content">{workflowPages.has(page) && page !== 'monitoring' ? <WorkflowGuide page={page} setPage={setPage} /> : null}{content}</main></div></div>;
+  return <div className="app-shell"><Sidebar page={page} setPage={(next) => { setPage(next); setSidebarOpen(false); }} open={sidebarOpen} /><div className="workspace"><AppHeader page={page} setPage={setPage} sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen} /><main className="content">{content}</main></div></div>;
 }

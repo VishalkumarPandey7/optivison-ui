@@ -67,7 +67,9 @@ if ($buildRequired) {
 }
 
 if (-not (Test-WorkerHealth)) {
-  Start-Process -FilePath $workerPython -ArgumentList @('server.py', '--model-dir', (Join-Path $workerRoot 'models')) -WorkingDirectory $workerRoot -WindowStyle Hidden
+  # Use the worker-relative model path so Start-Process does not split an
+  # absolute project path containing spaces into separate arguments.
+  Start-Process -FilePath $workerPython -ArgumentList @('server.py', '--model-dir', 'models') -WorkingDirectory $workerRoot -WindowStyle Hidden
 }
 
 if (-not (Test-Url 'http://127.0.0.1:4180/')) {

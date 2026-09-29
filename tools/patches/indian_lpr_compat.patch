@@ -58,3 +58,15 @@ index aa5f29a..7299210 100644
 @@ -413 +413 @@ class HighResolutionNet(nn.Module):
 -        last_inp_channels = np.int(np.sum(pre_stage_channels))
 +        last_inp_channels = int(np.sum(pre_stage_channels))
+diff --git a/src/License_Plate_Recognition/train_LPRNet.py b/src/License_Plate_Recognition/train_LPRNet.py
+--- a/src/License_Plate_Recognition/train_LPRNet.py
++++ b/src/License_Plate_Recognition/train_LPRNet.py
+@@ -129 +129 @@ def collate_fn(batch):
+-    labels = np.asarray(labels).flatten().astype(np.int)
++    labels = np.asarray(labels).flatten().astype(int)
+diff --git a/src/semantic_segmentation/utils/metrics.py b/src/semantic_segmentation/utils/metrics.py
+--- a/src/semantic_segmentation/utils/metrics.py
++++ b/src/semantic_segmentation/utils/metrics.py
+@@ -46 +46 @@ def fast_hist(seg_pred, label, num_class, ignore):
+-    seg_gt = np.asarray(label[:, : size[-2], : size[-1]], dtype=np.int)
++    seg_gt = np.asarray(label[:, : size[-2], : size[-1]], dtype=int)

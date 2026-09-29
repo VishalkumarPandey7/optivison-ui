@@ -11,6 +11,15 @@ import numpy as np
 import torch
 
 
+def _box_iou(left: list[int], right: list[int]) -> float:
+    intersection = max(0, min(left[2], right[2]) - max(left[0], right[0])) * max(0, min(left[3], right[3]) - max(left[1], right[1]))
+    if intersection <= 0:
+        return 0.0
+    left_area = max(1, (left[2] - left[0]) * (left[3] - left[1]))
+    right_area = max(1, (right[2] - right[0]) * (right[3] - right[1]))
+    return intersection / max(1, left_area + right_area - intersection)
+
+
 def _overlap_ratio(box: list[int], zone: dict[str, Any], width: int, height: int) -> float:
     left, top, right, bottom = box
     zone_left = float(zone.get("x", 0)) / 100 * width
@@ -74,30 +83,77 @@ class IndianLprRuntime:
         self._preprocess = preprocess_image
         self._decode = Greedy_Decode_inference
 
+    def _detect(self, image: np.ndarray) -> tuple[list[list[float]], list[float]]:
+        prepared = self._preprocess(image.copy())
+        if torch.cuda.is_available():
+            prepared = prepared.cuda()
+        with torch.no_grad():
+            scores, _classes, boxes = self._detector(prepared)
+        return boxes[0].detach().cpu().numpy().tolist(), scores[0].detach().cpu().numpy().tolist()
+
+    @staticmethod
+    def _plate_zone_views(image: np.ndarray, zones: list[dict[str, Any]]) -> list[tuple[np.ndarray, float, int, int]]:
+        """Return enlarged plate-ROI views and their original-frame transforms.
+
+        Indian_LPR's FCOS detector is sensitive to very small plates. Browser
+        frames are capped at 960px, so a distant plate can disappear even
+        though it is readable in the configured ROI. Retrying only the plate
+        zone keeps the fallback bounded while preserving full-frame box
+        coordinates for lifecycle filtering and display.
+        """
+        height, width = image.shape[:2]
+        drawn = [zone for zone in zones if float(zone.get("width", 0)) > 0.5 and float(zone.get("height", 0)) > 0.5]
+        named = [zone for zone in drawn if any(token in f'{zone.get("id", "")} {zone.get("name", "")}'.lower() for token in ("plate", "lpr", "number"))]
+        selected = named or drawn
+        views: list[tuple[np.ndarray, float, int, int]] = []
+        for zone in selected:
+            left = max(0, min(width - 1, round(float(zone.get("x", 0)) / 100 * width)))
+            top = max(0, min(height - 1, round(float(zone.get("y", 0)) / 100 * height)))
+            right = max(left + 1, min(width, round((float(zone.get("x", 0)) + float(zone.get("width", 0))) / 100 * width)))
+            bottom = max(top + 1, min(height, round((float(zone.get("y", 0)) + float(zone.get("height", 0))) / 100 * height)))
+            crop = image[top:bottom, left:right]
+            if crop.size == 0:
+                continue
+            scale = min(3.0, 1600.0 / max(crop.shape[:2]))
+            if scale < 1.25:
+                continue
+            enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            views.append((enlarged, scale, left, top))
+        return views
+
     def analyze(self, image: np.ndarray, zones: list[dict[str, Any]], minimum_roi_overlap: float) -> list[dict[str, Any]]:
         with self._lock:
             self._load()
-            prepared = self._preprocess(image.copy())
-            if torch.cuda.is_available():
-                prepared = prepared.cuda()
-            with torch.no_grad():
-                scores, _classes, boxes = self._detector(prepared)
-            raw_boxes = boxes[0].detach().cpu().numpy().tolist()
-            raw_scores = scores[0].detach().cpu().numpy().tolist()
             height, width = image.shape[:2]
             crops: list[torch.Tensor] = []
             usable: list[tuple[list[int], float]] = []
-            for raw_box, score in zip(raw_boxes, raw_scores):
-                box = [max(0, int(raw_box[0])), max(0, int(raw_box[1])), min(width, int(raw_box[2])), min(height, int(raw_box[3]))]
-                if box[2] <= box[0] or box[3] <= box[1]:
-                    continue
-                crop = image[box[1]:box[3], box[0]:box[2], :]
-                if crop.size == 0:
-                    continue
-                resized = cv2.resize(crop, (94, 24)).astype("float32")
-                resized = (resized - 127.5) * 0.0078125
-                crops.append(torch.from_numpy(np.transpose(resized, (2, 0, 1))))
-                usable.append((box, float(score)))
+            views: list[tuple[np.ndarray, float, int, int]] = [(image, 1.0, 0, 0)]
+            for view, scale, offset_x, offset_y in views:
+                raw_boxes, raw_scores = self._detect(view)
+                for raw_box, score in zip(raw_boxes, raw_scores):
+                    view_height, view_width = view.shape[:2]
+                    view_box = [max(0, int(raw_box[0])), max(0, int(raw_box[1])), min(view_width, int(raw_box[2])), min(view_height, int(raw_box[3]))]
+                    if view_box[2] <= view_box[0] or view_box[3] <= view_box[1]:
+                        continue
+                    box = [
+                        max(0, offset_x + int(view_box[0] / scale)),
+                        max(0, offset_y + int(view_box[1] / scale)),
+                        min(width, offset_x + int(view_box[2] / scale)),
+                        min(height, offset_y + int(view_box[3] / scale)),
+                    ]
+                    if box[2] <= box[0] or box[3] <= box[1] or any(_box_iou(box, existing[0]) >= 0.65 for existing in usable):
+                        continue
+                    crop = view[view_box[1]:view_box[3], view_box[0]:view_box[2], :]
+                    if crop.size == 0:
+                        continue
+                    resized = cv2.resize(crop, (94, 24)).astype("float32")
+                    resized = (resized - 127.5) * 0.0078125
+                    crops.append(torch.from_numpy(np.transpose(resized, (2, 0, 1))))
+                    usable.append((box, float(score)))
+                if usable:
+                    break
+                if len(views) == 1:
+                    views.extend(self._plate_zone_views(image, zones))
             if not crops:
                 return []
             labels = self._decode(self._recognizer, torch.stack(crops, 0))

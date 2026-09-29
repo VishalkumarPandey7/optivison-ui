@@ -10,7 +10,14 @@ import {
   type ReactNode
 } from 'react';
 import { requestJson, visionRuntimeConfig } from './services/workerApi';
-import { isArray, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
+import { backupStoredValue, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
+import {
+  defaultCameraCardMetrics,
+  migratePlantsAndCameras,
+  plantIdForName,
+  type CameraCardMetric,
+  type PlantRecord
+} from './state/migrations';
 
 export { workerUrl } from './services/workerApi';
 
@@ -214,6 +221,7 @@ export interface CameraConfiguration {
   signals: SignalDefinition[];
   rules: RuleDefinition[];
   businessRules: BusinessRuleDefinition[];
+  monitoringMetrics: CameraCardMetric[];
   display: DisplayConfiguration;
   analysisRoiIds: string[];
   minimumRoiOverlap: number;
@@ -222,6 +230,7 @@ export interface CameraConfiguration {
 
 export interface CameraRecord {
   id: string;
+  plantId: string;
   name: string;
   location: string;
   department: string;
@@ -259,16 +268,22 @@ interface VisionContextValue {
   workerDetail: string;
   models: ModelInfo[];
   cameras: CameraRecord[];
+  plants: PlantRecord[];
+  selectedPlantId: string;
   activeCameraId: string;
   frames: Record<string, AnalysisFrame>;
   running: Record<string, boolean>;
   events: RuntimeEvent[];
   metrics: Record<string, SessionMetrics>;
   setActiveCameraId: (cameraId: string) => void;
+  setSelectedPlantId: (plantId: string) => void;
+  addPlant: (name: string) => PlantRecord;
+  updatePlant: (id: string, name: string) => void;
   getCamera: (cameraId?: string) => CameraRecord;
   updateCamera: (cameraId: string, update: Partial<CameraRecord>) => void;
   updateConfiguration: (cameraId: string, update: Update<CameraConfiguration>) => void;
   addCamera: () => string | null;
+  addCameras: (count: number, plantId: string, plantName: string) => string[];
   removeCamera: (cameraId: string) => void;
   setVideoElement: (cameraId: string, node: HTMLVideoElement | null) => void;
   connectBrowserCamera: (cameraId: string, deviceId?: string) => Promise<void>;
@@ -334,6 +349,7 @@ const defaultConfiguration = (useCase: CameraConfiguration['useCase'] = 'worker'
   signals: defaultSignals(),
   rules: defaultRules(),
   businessRules: defaultBusinessRules(),
+  monitoringMetrics: defaultCameraCardMetrics(),
   display: defaultDisplay(),
   analysisRoiIds: [],
   minimumRoiOverlap: 0.5,
@@ -343,10 +359,12 @@ const defaultConfiguration = (useCase: CameraConfiguration['useCase'] = 'worker'
 function defaultCamera(index: number, useCase: CameraConfiguration['useCase'] = 'worker'): CameraRecord {
   const names = ['Assembly Line 01', 'Packaging Line 02', 'Machine Cell 03'];
   const departments = ['Assembly', 'Packaging', 'Machining'];
+  const location = index === 3 ? 'Plant B' : 'Plant A';
   return {
     id: `camera-${index}`,
+    plantId: plantIdForName(location),
     name: names[index - 1] ?? `Camera ${index}`,
-    location: index === 3 ? 'Plant B' : 'Plant A',
+    location,
     department: departments[index - 1] ?? 'Operations',
     productionLine: `Line ${String(index).padStart(2, '0')}`,
     sourceType: 'browser',
@@ -359,6 +377,9 @@ function defaultCamera(index: number, useCase: CameraConfiguration['useCase'] = 
 }
 
 const storageKey = 'optivision-approved-ui-engine-v1';
+const cameraStorageBackupKey = 'optivision-approved-ui-engine-v1:backup:pre-state-v2';
+const plantsStorageKey = 'optivision-plants-v1';
+const selectedPlantStorageKey = 'optivision-selected-plant-v1';
 const activeCameraStorageKey = 'optivision-active-camera-v1';
 const eventsStorageKey = 'optivision-runtime-events-v1';
 const metricsStorageKey = 'optivision-session-metrics-v1';
@@ -418,12 +439,19 @@ async function deleteCameraMedia(cameraId: string) {
   database.close();
 }
 
-function loadCameras(): CameraRecord[] {
+function loadVisionState(): { cameras: CameraRecord[]; plants: PlantRecord[] } {
   try {
-    const parsed = readStoredJson<CameraRecord[]>(storageKey, [], isArray<CameraRecord>);
-    if (!parsed.length) return [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
-    if (!Array.isArray(parsed) || !parsed.length) throw new Error('Invalid saved camera configuration.');
-    return parsed.map((camera) => {
+    const storedCameras = readStoredJson<unknown>(storageKey, []);
+    const hasStoredCameras = Array.isArray(storedCameras) && storedCameras.length > 0;
+    const cameraSource = hasStoredCameras
+      ? storedCameras
+      : [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
+    const storedPlants = readStoredJson<unknown>(plantsStorageKey, []);
+    const migrated = migratePlantsAndCameras(cameraSource, storedPlants);
+    if (hasStoredCameras) backupStoredValue(storageKey, cameraStorageBackupKey);
+    writeStoredJson(storageKey, migrated.cameras);
+    writeStoredJson(plantsStorageKey, migrated.plants);
+    const cameras = (migrated.cameras as unknown as CameraRecord[]).map((camera) => {
       const defaults = defaultConfiguration(camera.configuration?.useCase ?? 'worker');
       const savedZones = camera.configuration?.zones ?? [];
       const zones = [...savedZones, ...defaults.zones.filter((zone) => !savedZones.some((saved) => saved.id === zone.id))];
@@ -438,12 +466,15 @@ function loadCameras(): CameraRecord[] {
           ...camera.configuration,
           zones,
           businessRules: camera.configuration?.businessRules ?? defaultBusinessRules(),
+          monitoringMetrics: camera.configuration?.monitoringMetrics ?? defaultCameraCardMetrics(),
           display: { ...defaultDisplay(), ...(camera.configuration?.display ?? {}) }
         }
       };
     });
+    return { cameras, plants: migrated.plants };
   } catch {
-    return [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
+    const cameras = [defaultCamera(1, 'worker'), defaultCamera(2, 'worker'), defaultCamera(3, 'conveyor')];
+    return { cameras, plants: migratePlantsAndCameras(cameras, []).plants };
   }
 }
 
@@ -503,10 +534,19 @@ function PersistentRuntimeVideo({ camera, register }: { camera: CameraRecord; re
 }
 
 export function VisionProvider({ children }: { children: ReactNode }) {
+  const initialState = useRef<ReturnType<typeof loadVisionState> | null>(null);
+  if (!initialState.current) initialState.current = loadVisionState();
   const [workerStatus, setWorkerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [workerDetail, setWorkerDetail] = useState('Checking Ultralytics + Supervision worker');
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [cameras, setCameras] = useState<CameraRecord[]>(loadCameras);
+  const [cameras, setCameras] = useState<CameraRecord[]>(initialState.current.cameras);
+  const [plants, setPlants] = useState<PlantRecord[]>(initialState.current.plants);
+  const [selectedPlantId, setSelectedPlantId] = useState(() => {
+    const storedId = readStoredString(selectedPlantStorageKey);
+    return initialState.current?.plants.some((plant) => plant.id === storedId)
+      ? storedId
+      : initialState.current?.plants[0]?.id ?? '';
+  });
   const [activeCameraId, setActiveCameraId] = useState(() => {
     const storedId = readStoredString(activeCameraStorageKey);
     return cameras.some((camera) => camera.id === storedId) ? storedId! : cameras[0]?.id ?? 'camera-1';
@@ -535,6 +575,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   const activeAnalysisCount = useRef(0);
   const lastAnalysisStarted = useRef<Record<string, number>>({});
   const lastOutputs = useRef<Record<string, string[]>>({});
+  const lastErrorEvents = useRef<Record<string, { message: string; timestamp: number }>>({});
 
   useEffect(() => { cameraRef.current = cameras; }, [cameras]);
   useEffect(() => {
@@ -550,6 +591,8 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     writeStoredJson(storageKey, persistable);
   }, [cameras]);
   useEffect(() => { writeStoredString(activeCameraStorageKey, activeCameraId); }, [activeCameraId]);
+  useEffect(() => { writeStoredJson(plantsStorageKey, plants); }, [plants]);
+  useEffect(() => { writeStoredString(selectedPlantStorageKey, selectedPlantId); }, [selectedPlantId]);
   useEffect(() => { writeStoredJson(eventsStorageKey, events.slice(0, 500)); }, [events]);
   useEffect(() => {
     const persistable = Object.fromEntries(Object.entries(metrics).map(([cameraId, value]) => [cameraId, { ...value, lastTimestamp: null }]));
@@ -575,7 +618,30 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   }, [refreshModels]);
 
   const updateCamera = useCallback((cameraId: string, update: Partial<CameraRecord>) => {
-    setCameras((current) => current.map((camera) => camera.id === cameraId ? { ...camera, ...update } : camera));
+    let normalizedUpdate = update;
+    if (typeof update.location === 'string') {
+      const location = update.location.trim().replace(/\s+/g, ' ') || 'Unassigned Plant';
+      const plantId = plantIdForName(location);
+      normalizedUpdate = { ...update, location, plantId };
+      setPlants((current) => current.some((plant) => plant.id === plantId)
+        ? current
+        : [...current, { id: plantId, name: location }]);
+    }
+    setCameras((current) => current.map((camera) => camera.id === cameraId ? { ...camera, ...normalizedUpdate } : camera));
+  }, []);
+
+  const addPlant = useCallback((name: string) => {
+    const normalized = name.trim().replace(/\s+/g, ' ') || 'Unassigned Plant';
+    const plant = { id: plantIdForName(normalized), name: normalized };
+    setPlants((current) => current.some((item) => item.id === plant.id) ? current : [...current, plant]);
+    return plant;
+  }, []);
+
+  const updatePlant = useCallback((id: string, name: string) => {
+    const normalized = name.trim().replace(/\s+/g, ' ');
+    if (!normalized) return;
+    setPlants((current) => current.map((plant) => plant.id === id ? { ...plant, name: normalized } : plant));
+    setCameras((current) => current.map((camera) => camera.plantId === id ? { ...camera, location: normalized } : camera));
   }, []);
 
   const updateConfiguration = useCallback((cameraId: string, update: Update<CameraConfiguration>) => {
@@ -589,7 +655,15 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     cameras.filter((camera) => camera.sourceType === 'uploaded' && camera.sourceLabel).forEach((camera) => {
       void loadCameraMedia(camera.id).then((media) => {
-        if (!media || cancelled) return;
+        if (cancelled) return;
+        if (!media) {
+          updateCamera(camera.id, {
+            sourceStatus: 'error',
+            sourceUrl: '',
+            error: `The saved video "${camera.sourceLabel}" is not available in this browser. Select the video again to reconnect this camera.`
+          });
+          return;
+        }
         const url = URL.createObjectURL(media.blob);
         if (cancelled) { URL.revokeObjectURL(url); return; }
         if (uploadUrlRefs.current[camera.id]) URL.revokeObjectURL(uploadUrlRefs.current[camera.id]);
@@ -798,6 +872,31 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     return next.id;
   }, []);
 
+  const addCameras = useCallback((count: number, plantId: string, plantName: string) => {
+    const requested = Math.max(0, Math.floor(count));
+    const available = Math.max(0, 7 - cameraRef.current.length);
+    const amount = Math.min(requested, available);
+    if (!amount) return [];
+
+    const used = new Set(cameraRef.current.map((camera) => camera.id));
+    const slots = Array.from({ length: 7 }, (_, item) => item + 1)
+      .filter((item) => !used.has(`camera-${item}`))
+      .slice(0, amount);
+    const normalizedPlantName = plantName.trim().replace(/\s+/g, ' ') || 'Unassigned Plant';
+    const additions = slots.map((index) => ({
+      ...defaultCamera(index),
+      plantId,
+      location: normalizedPlantName
+    }));
+    if (!additions.length) return [];
+
+    const next = [...cameraRef.current, ...additions].sort((left, right) => left.id.localeCompare(right.id));
+    cameraRef.current = next;
+    setCameras(next);
+    setActiveCameraId(additions[0].id);
+    return additions.map((camera) => camera.id);
+  }, []);
+
   const removeCamera = useCallback((cameraId: string) => {
     if (cameraRef.current.length <= 1) return;
     stopSource(cameraId);
@@ -810,6 +909,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
+      if (workerStatus !== 'online') return;
       const availableSlots = Math.max(0, visionRuntimeConfig.maxConcurrentAnalyses - activeAnalysisCount.current);
       cameraRef.current
         .filter((camera) => {
@@ -837,6 +937,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             const config = camera.configuration;
             const drawnZones = config.zones.filter(isZoneDrawn);
             const drawnIds = new Set(drawnZones.map((zone) => zone.id));
+            const activeAnalysisRoiIds = config.analysisRoiIds.filter((id) => drawnIds.has(id));
             const signals = config.signals.map((signal) => ({ ...signal, analysisEnabled: !signal.zoneId || drawnIds.has(signal.zoneId) }));
             const enabledSignalIds = new Set(signals.filter((signal) => signal.analysisEnabled).map((signal) => signal.id));
             const rules = config.rules.map((rule) => ({ ...rule, analysisEnabled: rule.conditions.every((condition) => enabledSignalIds.has(condition.signalId)) }));
@@ -854,7 +955,11 @@ export function VisionProvider({ children }: { children: ReactNode }) {
                 classNames: requiredClasses(config.signals),
                 zones: drawnZones.map(({ color: _color, ...zone }) => zone),
                 countingLines: config.countingLines.filter(lineIsDrawn),
-                analysisRoiIds: config.analysisRoiIds.filter((id) => drawnIds.has(id)),
+                // Omitting the field means whole-frame analysis. The worker
+                // deliberately treats an explicitly empty list as "reject all",
+                // which previously discarded valid LPR detections when the
+                // lifecycle station used the optional Whole camera frame mode.
+                ...(activeAnalysisRoiIds.length ? { analysisRoiIds: activeAnalysisRoiIds } : {}),
                 minimumRoiOverlap: config.minimumRoiOverlap,
                 signalDefinitions: signals,
                 rules
@@ -886,11 +991,17 @@ export function VisionProvider({ children }: { children: ReactNode }) {
                 lastTimestamp: response.timestamp
               } };
             });
+            delete lastErrorEvents.current[camera.id];
             if (camera.error) updateCamera(camera.id, { error: '' });
           } catch (error) {
             const message = error instanceof Error ? error.message : 'Frame analysis failed.';
-            updateCamera(camera.id, { error: message });
-            setEvents((current) => [{ id: `${camera.id}-error-${Date.now()}`, cameraId: camera.id, timestamp: Date.now() / 1000, type: 'error' as const, title: 'Analysis error', detail: message }, ...current].slice(0, 500));
+            const timestamp = Date.now() / 1000;
+            const previousError = lastErrorEvents.current[camera.id];
+            if (camera.error !== message) updateCamera(camera.id, { error: message });
+            if (!previousError || previousError.message !== message || timestamp - previousError.timestamp >= 30) {
+              lastErrorEvents.current[camera.id] = { message, timestamp };
+              setEvents((current) => [{ id: `${camera.id}-error-${Date.now()}`, cameraId: camera.id, timestamp, type: 'error' as const, title: 'Analysis error', detail: message }, ...current].slice(0, 500));
+            }
           } finally {
             analyzing.current[camera.id] = false;
             activeAnalysisCount.current = Math.max(0, activeAnalysisCount.current - 1);
@@ -899,20 +1010,20 @@ export function VisionProvider({ children }: { children: ReactNode }) {
       });
     }, visionRuntimeConfig.analysisIntervalMs);
     return () => window.clearInterval(timer);
-  }, [running, updateCamera]);
+  }, [running, updateCamera, workerStatus]);
 
   useEffect(() => () => {
     Object.keys(streamRefs.current).forEach(stopSource);
   }, [stopSource]);
 
-  const getCamera = useCallback((cameraId?: string) => cameraRef.current.find((camera) => camera.id === (cameraId ?? activeCameraId)) ?? cameraRef.current[0], [activeCameraId]);
+  const getCamera = useCallback((cameraId?: string) => cameras.find((camera) => camera.id === (cameraId ?? activeCameraId)) ?? cameras[0], [activeCameraId, cameras]);
 
   const value = useMemo<VisionContextValue>(() => ({
-    workerStatus, workerDetail, models, cameras, activeCameraId, frames, running, events, metrics,
-    setActiveCameraId, getCamera, updateCamera, updateConfiguration, addCamera, removeCamera,
+    workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics,
+    setActiveCameraId, setSelectedPlantId, addPlant, updatePlant, getCamera, updateCamera, updateConfiguration, addCamera, addCameras, removeCamera,
     setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera,
     toggleEngine, resetCamera, refreshModels
-  }), [workerStatus, workerDetail, models, cameras, activeCameraId, frames, running, events, metrics, getCamera, updateCamera, updateConfiguration, addCamera, removeCamera, setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera, toggleEngine, resetCamera, refreshModels]);
+  }), [workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics, addPlant, updatePlant, getCamera, updateCamera, updateConfiguration, addCamera, addCameras, removeCamera, setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera, toggleEngine, resetCamera, refreshModels]);
 
   return <VisionContext.Provider value={value}>
     <div className="vision-runtime-layer" aria-hidden="true">
@@ -930,3 +1041,4 @@ export function useVision() {
 
 export { fileToDataUrl, trainingApi } from './services/trainingApi';
 export type { TrainingAnnotation, TrainingImage, TrainingProject, TrainingState, TrainingVersion } from './services/trainingApi';
+export type { CameraCardMetric, PlantRecord } from './state/migrations';

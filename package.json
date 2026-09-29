@@ -11,6 +11,7 @@
     "build": "tsc && vite build --configLoader runner",
     "preview": "vite preview --configLoader runner --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
+    "validate:migrations": "tsc src/state/migrations.ts --outDir tmp/migration-validation --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tools/validate-state-migrations.mjs",
     "check": "npm run typecheck && npm run build"
   },
   "dependencies": {
