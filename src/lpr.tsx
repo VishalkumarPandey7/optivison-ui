@@ -90,6 +90,7 @@ export interface LprCandidate {
   lastSeen: number;
   confirmed: boolean;
   observations: number;
+  matchingReads: number;
   votes: Record<string, number>;
   lastBox: number[];
   plateImage?: string;
@@ -104,7 +105,10 @@ const workspaceSectionStorageKey = 'optivision-lpr-workspace-section-v1';
 // v4 starts clean because earlier versions could create multiple journeys when
 // the OCR text changed while the same physical plate remained in view.
 const journeyStorageKey = 'optivision-lpr-journeys-v5';
-const consecutiveFrameToleranceSeconds = 8;
+// CPU LPR inference can take 6-10 seconds for a high-resolution ROI. Keep the
+// same physical plate candidate alive long enough for the second analyzed
+// frame to arrive, while still expiring it shortly after the vehicle leaves.
+const consecutiveFrameToleranceSeconds = 30;
 
 function plateDistance(left: string, right: string) {
   const rows = left.length + 1; const columns = right.length + 1;
@@ -123,9 +127,12 @@ function isUsablePlateRead(value: string) {
   const plate = normalizePlate(value);
   const letters = (plate.match(/[A-Z]/g) ?? []).length;
   const digits = (plate.match(/[0-9]/g) ?? []).length;
-  // Accept regional Indian formats without forcing one exact state/RTO pattern,
-  // while rejecting short detector noise before it can start a lifecycle.
-  return plate.length >= 6 && plate.length <= 12 && letters >= 2 && digits >= 2;
+  const standardIndianPlate = /^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$/.test(plate);
+  const bharatSeriesPlate = /^\d{2}BH\d{4}[A-Z]{1,2}$/.test(plate);
+  // Reject detector noise and impossible five-digit registration suffixes
+  // before they enter temporal voting or start a lifecycle.
+  return plate.length >= 6 && plate.length <= 12 && letters >= 2 && digits >= 2
+    && (standardIndianPlate || bharatSeriesPlate);
 }
 
 function platesLikelyMatch(leftInput: string, rightInput: string) {
@@ -133,11 +140,34 @@ function platesLikelyMatch(leftInput: string, rightInput: string) {
   const right = normalizePlate(rightInput);
   if (!left || !right) return false;
   if (left === right) return true;
+  const distance = plateDistance(left, right);
   // Indian plates can gain/lose a character in the middle during OCR while
   // retaining the stable state/RTO prefix and four-digit registration suffix.
-  return left.length >= 8 && right.length >= 8
+  if (left.length >= 8 && right.length >= 8
     && left.slice(0, 4) === right.slice(0, 4)
-    && left.slice(-4) === right.slice(-4);
+    && left.slice(-4) === right.slice(-4)) return true;
+  // Blurred crops commonly confuse two or three characters (C/K, 0/8, 1/4).
+  // Keep those readings in one temporal candidate when their state prefix is
+  // stable, without merging unrelated plates merely because they share a camera.
+  return left.length >= 8 && right.length >= 8
+    && left.slice(0, 2) === right.slice(0, 2)
+    && Math.abs(left.length - right.length) <= 1
+    && distance <= 3;
+}
+
+function consensusFromVotes(votes: Record<string, number>, latestPlate: string) {
+  return Object.entries(votes)
+    .map(([plate, exactVotes]) => ({
+      plate,
+      exactVotes,
+      relatedVotes: Object.entries(votes)
+        .filter(([observedPlate]) => platesLikelyMatch(plate, observedPlate))
+        .reduce((total, [, count]) => total + count, 0)
+    }))
+    .sort((left, right) => right.relatedVotes - left.relatedVotes
+      || right.exactVotes - left.exactVotes
+      || Number(right.plate === latestPlate) - Number(left.plate === latestPlate)
+      || right.plate.length - left.plate.length)[0];
 }
 
 function fingerprintDistance(left?: string, right?: string) {
@@ -192,9 +222,22 @@ function openVisit(journey: LprJourney, stageId: string) {
   return [...journey.visits].reverse().find((visit) => visit.stageId === stageId && visit.leftAt === undefined);
 }
 
-function observeJourney(current: LprJourney[], process: LprProcess, stage: LprStage, plateInput: string, timestamp: number, workerState: WorkerState, visual?: { plateImage?: string; plateFingerprint?: string }) {
+function observeJourney(current: LprJourney[], process: LprProcess, stage: LprStage, plateInput: string, timestamp: number, workerState: WorkerState, visual?: { plateImage?: string; plateFingerprint?: string; firstSeenAt?: number }) {
   const plate = normalizePlate(plateInput);
   if (!plate) return current;
+  // OCR confirmation may arrive several seconds after the first readable
+  // frame. Use that first observation for entry/station arrival while keeping
+  // the confirmation time as the latest activity and exit completion time.
+  const firstObservedAt = Math.min(timestamp, visual?.firstSeenAt ?? timestamp);
+  const initialObservedSeconds = Math.max(0, timestamp - firstObservedAt);
+  const initialVisit = (): LprVisit => ({
+    stageId: stage.id,
+    enteredAt: firstObservedAt,
+    lastSeenAt: timestamp,
+    workingSeconds: stage.trackWorker && workerState === 'working' ? initialObservedSeconds : 0,
+    idleSeconds: stage.trackWorker && workerState === 'idle' ? initialObservedSeconds : 0,
+    absentSeconds: stage.trackWorker && workerState === 'absent' ? initialObservedSeconds : 0
+  });
   const matchingJourneys = current
     .map((journey, index) => ({ journey, index }))
     .filter(({ journey }) => journey.processId === process.id && journey.status === 'active' && plateIdentityMatches(journey.plate, plate, journey.plateFingerprint, visual?.plateFingerprint))
@@ -207,10 +250,10 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
   let journey: LprJourney;
   if (existingIndex < 0) {
     journey = {
-      id: `${process.id}-${plate}-${timestamp}`, plate, processId: process.id, status: 'active', startedAt: timestamp,
+      id: `${process.id}-${plate}-${firstObservedAt}`, plate, processId: process.id, status: 'active', startedAt: firstObservedAt,
       lastActivityAt: timestamp, plateImage: visual?.plateImage, plateFingerprint: visual?.plateFingerprint,
-      currentStageId: stage.id, workerState, visits: [{ stageId: stage.id, enteredAt: timestamp, lastSeenAt: timestamp, workingSeconds: 0, idleSeconds: 0, absentSeconds: 0 }],
-      events: [event('journey_started', stage.id, timestamp, `${plate} lifecycle started`), event('vehicle_entered', stage.id, timestamp, `${plate} entered ${stage.name}`)]
+      currentStageId: stage.id, workerState, visits: [initialVisit()],
+      events: [event('journey_started', stage.id, firstObservedAt, `${plate} lifecycle started`), event('vehicle_entered', stage.id, firstObservedAt, `${plate} entered ${stage.name}`)]
     };
   } else {
     journey = structuredClone(current[existingIndex]);
@@ -232,22 +275,22 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
     const observedMappedIndex = mappedStages.findIndex((item) => item.id === stage.id);
     if (journey.currentStageId !== stage.id && process.flowMode !== 'flexible' && observedMappedIndex !== currentMappedIndex + 1) return current;
     const lastVisit = journey.visits[journey.visits.length - 1];
-    if (journey.currentStageId !== stage.id && timestamp - lastVisit.enteredAt < (process.minimumTransitionSeconds ?? 2)) return current;
+    if (journey.currentStageId !== stage.id && firstObservedAt - lastVisit.enteredAt < (process.minimumTransitionSeconds ?? 2)) return current;
     if (journey.currentStageId !== stage.id) {
       if (activeVisit) { activeVisit.leftAt = activeVisit.lastSeenAt; journey.events.push(event('vehicle_left', activeVisit.stageId, activeVisit.lastSeenAt, `${journey.plate} left previous zone`)); }
       journey.currentStageId = stage.id;
       journey.workerState = workerState;
-      journey.visits.push({ stageId: stage.id, enteredAt: timestamp, lastSeenAt: timestamp, workingSeconds: 0, idleSeconds: 0, absentSeconds: 0 });
-      journey.events.push(event('vehicle_entered', stage.id, timestamp, `${journey.plate} entered ${stage.name}`));
+      journey.visits.push(initialVisit());
+      journey.events.push(event('vehicle_entered', stage.id, firstObservedAt, `${journey.plate} entered ${stage.name}`));
       if (stage.trackWorker) {
         const type = workerState === 'working' ? 'work_started' : workerState === 'absent' ? 'worker_absent' : 'work_stopped';
         journey.events.push(event(type, stage.id, timestamp, `Worker ${workerState} at ${stage.name}`));
       }
     } else if (!activeVisit) {
-      journey.visits.push({ stageId: stage.id, enteredAt: timestamp, lastSeenAt: timestamp, workingSeconds: 0, idleSeconds: 0, absentSeconds: 0 });
-      journey.events.push(event('vehicle_entered', stage.id, timestamp, `${journey.plate} returned to ${stage.name}`));
+      journey.visits.push(initialVisit());
+      journey.events.push(event('vehicle_entered', stage.id, firstObservedAt, `${journey.plate} returned to ${stage.name}`));
     } else {
-      const delta = Math.max(0, Math.min(5, timestamp - activeVisit.lastSeenAt));
+      const delta = Math.max(0, Math.min(consecutiveFrameToleranceSeconds, timestamp - activeVisit.lastSeenAt));
       if (journey.workerState === 'working') activeVisit.workingSeconds += delta;
       else if (journey.workerState === 'idle') activeVisit.idleSeconds += delta;
       else activeVisit.absentSeconds += delta;
@@ -274,6 +317,21 @@ function workerStateFromFrame(frame: AnalysisFrame): WorkerState {
   if (frame.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active)) return 'working';
   if (frame.rules.some((rule) => rule.output === 'OPERATOR_ABSENT' && rule.active)) return 'absent';
   return 'idle';
+}
+
+function closeExpiredCandidateVisits(current: LprJourney[], expiredCandidates: LprCandidate[], processes: LprProcess[]) {
+  return expiredCandidates.reduce((journeys, candidate) => journeys.map((journey) => {
+    if (journey.status !== 'active' || journey.processId !== candidate.processId || journey.currentStageId !== candidate.stageId) return journey;
+    if (!plateIdentityMatches(journey.plate, candidate.plate, journey.plateFingerprint, candidate.plateFingerprint)) return journey;
+    const copy = structuredClone(journey);
+    const visit = openVisit(copy, candidate.stageId);
+    if (!visit) return journey;
+    visit.leftAt = candidate.lastSeen;
+    visit.lastSeenAt = candidate.lastSeen;
+    const stage = processes.find((process) => process.id === candidate.processId)?.stages.find((item) => item.id === candidate.stageId);
+    copy.events.push(event('vehicle_left', candidate.stageId, candidate.lastSeen, `${copy.plate} left ${stage?.name ?? 'station'}`));
+    return copy;
+  }), current);
 }
 
 export function LprProvider({ children }: { children: ReactNode }) {
@@ -345,7 +403,7 @@ export function LprProvider({ children }: { children: ReactNode }) {
       const plates = frame.detections.filter((detection) => detection.className === 'license_plate' && detection.plateText && isUsablePlateRead(detection.plateText));
       const workerState = workerStateFromFrame(frame);
       const matchedKeys = new Set<string>();
-      const confirmed: Array<{ process: LprProcess; stage: LprStage; plate: string; plateImage?: string; plateFingerprint?: string }> = [];
+      const confirmed: Array<{ process: LprProcess; stage: LprStage; plate: string; plateImage?: string; plateFingerprint?: string; firstSeenAt: number }> = [];
       // Lifecycle recording is automatic for every mapped process. There is no
       // separate lifecycle start button: a valid entry-camera plate starts it.
       processes.forEach((process) => {
@@ -362,26 +420,29 @@ export function LprProvider({ children }: { children: ReactNode }) {
             const previous = related ?? candidateMap.current[key];
             const continuous = previous && frame.timestamp - previous.lastSeen <= consecutiveFrameToleranceSeconds;
             const votes = continuous ? { ...previous.votes, [normalizedPlate]: (previous.votes[normalizedPlate] ?? 0) + 1 } : { [normalizedPlate]: 1 };
-            const consensusPlate = Object.entries(votes).sort((left, right) => right[1] - left[1])[0][0];
+            const consensus = consensusFromVotes(votes, normalizedPlate);
+            const consensusPlate = consensus.plate;
+            const matchingReads = consensus.relatedVotes;
             const observations = continuous ? previous.observations + 1 : 1;
             const candidate: LprCandidate = {
               key, plate: consensusPlate, processId: process.id, stageId: stage.id, cameraId,
               firstSeen: continuous ? previous.firstSeen : frame.timestamp,
               lastSeen: frame.timestamp,
-              // The worker has already detected the plate, cropped it and run the
-              // LPR recognizer on that captured image. One valid OCR result is
-              // therefore enough to start the lifecycle; later frames only vote
-              // for matching and do not gate the initial record.
-              confirmed: true,
+              // A lifecycle must not be created from one unstable OCR frame.
+              // Two matching reads retain fast entry capture while rejecting
+              // the common one-frame extra/missing-character result.
+              confirmed: matchingReads >= 2,
               observations,
+              matchingReads,
               votes,
               lastBox: plate.box,
               plateImage: plate.plateImage ?? previous?.plateImage,
               plateFingerprint: plate.plateFingerprint ?? previous?.plateFingerprint
             };
             candidateMap.current[key] = candidate;
-            // Record the temporal majority-vote value, not the latest noisy OCR frame.
-            if (candidate.confirmed) confirmed.push({ process, stage, plate: candidate.plate, plateImage: candidate.plateImage, plateFingerprint: candidate.plateFingerprint });
+            // Record only a confirmed temporal majority-vote value, not the
+            // latest noisy OCR frame.
+            if (candidate.confirmed) confirmed.push({ process, stage, plate: candidate.plate, plateImage: candidate.plateImage, plateFingerprint: candidate.plateFingerprint, firstSeenAt: candidate.firstSeen });
           });
         });
       });
@@ -394,25 +455,29 @@ export function LprProvider({ children }: { children: ReactNode }) {
       });
       setPlateCandidates(Object.values(candidateMap.current));
       if (confirmed.length || expiredCandidates.length) setJourneys((current) => {
-        let next = confirmed.reduce((items, item) => observeJourney(items, item.process, item.stage, item.plate, frame.timestamp, workerState, item), current);
-        expiredCandidates.forEach((candidate) => {
-          next = next.map((journey) => {
-            if (journey.status !== 'active' || journey.processId !== candidate.processId || journey.currentStageId !== candidate.stageId) return journey;
-            if (!plateIdentityMatches(journey.plate, candidate.plate, journey.plateFingerprint, candidate.plateFingerprint)) return journey;
-            const copy = structuredClone(journey);
-            const visit = openVisit(copy, candidate.stageId);
-            if (!visit) return journey;
-            visit.leftAt = candidate.lastSeen;
-            visit.lastSeenAt = candidate.lastSeen;
-            const stage = processes.find((process) => process.id === candidate.processId)?.stages.find((item) => item.id === candidate.stageId);
-            copy.events.push(event('vehicle_left', candidate.stageId, candidate.lastSeen, `${copy.plate} left ${stage?.name ?? 'station'}`));
-            return copy;
-          });
-        });
-        return next;
+        const observed = confirmed.reduce((items, item) => observeJourney(items, item.process, item.stage, item.plate, frame.timestamp, workerState, item), current);
+        return closeExpiredCandidateVisits(observed, expiredCandidates, processes);
       });
     });
   }, [vision.frames, processes]);
+
+  useEffect(() => {
+    // Close an open station visit even when its camera or engine stops and no
+    // later analysis frame arrives to perform candidate cleanup.
+    const timer = window.setInterval(() => {
+      const now = Date.now() / 1000;
+      const expiredCandidates: LprCandidate[] = [];
+      Object.entries(candidateMap.current).forEach(([key, candidate]) => {
+        if (now - candidate.lastSeen <= consecutiveFrameToleranceSeconds) return;
+        expiredCandidates.push(candidate);
+        delete candidateMap.current[key];
+      });
+      if (!expiredCandidates.length) return;
+      setPlateCandidates(Object.values(candidateMap.current));
+      setJourneys((current) => closeExpiredCandidateVisits(current, expiredCandidates, processes));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [processes]);
 
   const value = useMemo<LprContextValue>(() => ({
     processes, journeys, plateCandidates, selectedProcessId, setSelectedProcessId,
@@ -468,7 +533,7 @@ function duration(seconds: number) {
   return `${Math.floor(total / 3600)}h ${Math.floor(total % 3600 / 60)}m ${total % 60}s`;
 }
 
-function stageDuration(visit: LprVisit) { return (visit.leftAt ?? visit.lastSeenAt) - visit.enteredAt; }
+function stageDuration(visit: LprVisit) { return Math.max(0, (visit.leftAt ?? visit.lastSeenAt) - visit.enteredAt); }
 
 export function LegacyLprPage() {
   const vision = useVision();
@@ -497,7 +562,7 @@ export function LegacyLprPage() {
       <section className="panel lpr-flow"><div className="section-heading"><div><span className="eyebrow">PROCESS FLOW</span><h2>Camera and zone sequence</h2><p>The first valid plate crop at the entry stage starts its lifecycle immediately. A zone is optional when one camera represents one checkpoint.</p></div><button className="secondary" type="button" onClick={addStage}><Plus size={15} /> Add station</button></div><div className="lpr-stage-flow">{process.stages.map((stage, index) => { const camera = vision.getCamera(stage.cameraId); return <div className="lpr-stage-wrap" key={stage.id}><article className={`lpr-stage ${stage.type}`}><header><span>{index + 1}</span><select value={stage.type} onChange={(e) => updateStage(stage.id, { type: e.target.value as StageType })}><option value="entry">Entry point</option><option value="station">Work station</option><option value="exit">Exit point</option></select><button title="Remove stage" disabled={process.stages.length <= 2} type="button" onClick={() => updateStages(process.stages.filter((item) => item.id !== stage.id))}><Trash2 size={14} /></button></header><label><small>Stage name</small><input value={stage.name} onChange={(e) => updateStage(stage.id, { name: e.target.value })} /></label><label><small>Camera</small><select value={stage.cameraId} onChange={(e) => { const nextCamera = vision.getCamera(e.target.value); updateStage(stage.id, { cameraId: e.target.value, zoneId: '' }); }}>{vision.cameras.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label><small>Plate ROI / zone (optional)</small><select value={stage.zoneId} onChange={(e) => updateStage(stage.id, { zoneId: e.target.value })}><option value="">Whole camera frame</option>{camera.configuration.zones.map((zone) => <option value={zone.id} key={zone.id}>{zone.name}</option>)}</select></label><label className="lpr-check"><input type="checkbox" checked={stage.trackWorker} onChange={(e) => updateStage(stage.id, { trackWorker: e.target.checked })} /> Track worker start / stop</label></article>{index < process.stages.length - 1 ? <ArrowRight className="lpr-arrow" size={20} /> : null}</div>; })}</div></section>
       <section className="panel lpr-test"><div><span className="eyebrow">TEST THE FLOW</span><h3>Record a simulated scan</h3><p>Use this before connecting cameras to verify lifecycle timing and summaries.</p></div><input aria-label="Test number plate" value={plate} onChange={(e) => setPlate(e.target.value.toUpperCase())} /><select value={testStageId || process.stages[0]?.id} onChange={(e) => setTestStageId(e.target.value)}>{process.stages.map((stage) => <option value={stage.id} key={stage.id}>{stage.name}</option>)}</select><select value={testWorker} onChange={(e) => setTestWorker(e.target.value as WorkerState)}><option value="working">Worker working</option><option value="idle">Worker stopped / idle</option><option value="absent">Worker absent</option></select><button className="primary" type="button" onClick={() => { lpr.recordScan(process.id, testStageId || process.stages[0]?.id, plate, testWorker); setTab('live'); }}><ScanLine size={15} /> Record scan</button></section>
     </> : null}
-    {tab === 'live' ? <><section className="panel lpr-verification"><div className="section-heading"><div><span className="eyebrow">PLATE CAPTURE</span><h2>Immediate snapshot recognition</h2><p>The strongest valid plate crop is saved immediately and reused as the vehicle identity.</p></div></div>{lpr.plateCandidates.filter((item) => !process || item.processId === process.id).map((candidate) => { const stage = process?.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>Captured and recorded</strong><small>{stage?.name ?? candidate.stageId} · OCR {candidate.plate}</small><i><b style={{ width: '100%' }} /></i></span></article>; })}{!lpr.plateCandidates.some((item) => !process || item.processId === process.id) ? <div className="timeline-empty">Waiting for a number plate detection from a running LPR camera.</div> : null}</section><section className="panel lpr-journeys"><div className="section-heading"><div><span className="eyebrow">ACTIVE LIFECYCLES</span><h2>Vehicles currently in process</h2></div></div>{activeJourneys.length ? activeJourneys.map((journey) => { const stage = process?.stages.find((item) => item.id === journey.currentStageId); return <button type="button" key={journey.id} onClick={() => { setSelectedJourneyId(journey.id); setTab('history'); }}><span className="plate-badge">{journey.plate}</span><span><strong>{stage?.name ?? journey.currentStageId}</strong><small>Captured {new Date(journey.startedAt * 1000).toLocaleTimeString()}</small></span><span><small>Elapsed</small><strong>{duration(Date.now() / 1000 - journey.startedAt)}</strong></span><ArrowRight size={16} /></button>; }) : <div className="timeline-empty">No vehicle captured yet. Start the mapped entry camera and show a readable number plate.</div>}</section></> : null}
+    {tab === 'live' ? <><section className="panel lpr-verification"><div className="section-heading"><div><span className="eyebrow">PLATE CAPTURE</span><h2>Verified snapshot recognition</h2><p>A plate is recorded after two matching OCR reads inside the configured Number Plate Zone.</p></div></div>{lpr.plateCandidates.filter((item) => !process || item.processId === process.id).map((candidate) => { const stage = process?.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>{candidate.confirmed ? 'Captured and recorded' : 'Verifying OCR'}</strong><small>{stage?.name ?? candidate.stageId} · OCR {candidate.plate} · {Math.min(2, candidate.matchingReads)}/2 matching reads</small><i><b style={{ width: `${candidate.confirmed ? 100 : 50}%` }} /></i></span></article>; })}{!lpr.plateCandidates.some((item) => !process || item.processId === process.id) ? <div className="timeline-empty">Waiting for a number plate detection from a running LPR camera.</div> : null}</section><section className="panel lpr-journeys"><div className="section-heading"><div><span className="eyebrow">ACTIVE LIFECYCLES</span><h2>Vehicles currently in process</h2></div></div>{activeJourneys.length ? activeJourneys.map((journey) => { const stage = process?.stages.find((item) => item.id === journey.currentStageId); return <button type="button" key={journey.id} onClick={() => { setSelectedJourneyId(journey.id); setTab('history'); }}><span className="plate-badge">{journey.plate}</span><span><strong>{stage?.name ?? journey.currentStageId}</strong><small>Captured {new Date(journey.startedAt * 1000).toLocaleTimeString()}</small></span><span><small>Elapsed</small><strong>{duration(Date.now() / 1000 - journey.startedAt)}</strong></span><ArrowRight size={16} /></button>; }) : <div className="timeline-empty">No vehicle captured yet. Start the mapped entry camera and show a readable number plate.</div>}</section></> : null}
     {tab === 'history' ? <section className="lpr-history-layout"><div className="panel lpr-history-list"><div className="section-heading"><div><span className="eyebrow">JOURNEYS</span><h2>Plate history</h2></div></div>{processJourneys.map((journey) => <button className={selectedJourney?.id === journey.id ? 'active' : ''} type="button" key={journey.id} onClick={() => setSelectedJourneyId(journey.id)}><span className="plate-badge">{journey.plate}</span><span><strong>{journey.status}</strong><small>{new Date(journey.startedAt * 1000).toLocaleString()}</small></span></button>)}</div>{selectedJourney ? <div className="panel lpr-summary"><header><div><span className="plate-badge large">{selectedJourney.plate}</span><h2>Lifecycle summary</h2><p>Total {duration((selectedJourney.completedAt ?? Date.now() / 1000) - selectedJourney.startedAt)}</p></div><span className={`pill ${selectedJourney.status === 'completed' ? 'green' : 'orange'}`}>{selectedJourney.status}</span></header><div className="lpr-visit-grid">{selectedJourney.visits.map((visit, index) => { const stage = process?.stages.find((item) => item.id === visit.stageId); const previous = selectedJourney.visits[index - 1]; const travel = previous ? visit.enteredAt - (previous.leftAt ?? previous.lastSeenAt) : 0; return <article key={`${visit.stageId}-${visit.enteredAt}`}><span>{index + 1}</span><strong>{stage?.name ?? visit.stageId}</strong><small>At station: {duration(stageDuration(visit))}</small><small>Working: {duration(visit.workingSeconds)}</small><small>Stopped/idle: {duration(visit.idleSeconds)}</small><small>Worker absent: {duration(visit.absentSeconds)}</small>{previous ? <em>Between zones: {duration(travel)}</em> : null}</article>; })}</div><div className="lpr-event-list">{selectedJourney.events.slice().reverse().map((item) => <div key={item.id}><time>{new Date(item.timestamp * 1000).toLocaleTimeString()}</time><i /><span><strong>{item.detail}</strong><small>{item.type.replaceAll('_', ' ')}</small></span></div>)}</div></div> : <div className="panel timeline-empty">Select a journey to view the station and worker-time summary.</div>}</section> : null}
   </div>;
 }
@@ -536,10 +601,28 @@ function shortDuration(seconds: number) {
   return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-function journeyTotal(journey: LprJourney) { return (journey.completedAt ?? Date.now() / 1000) - journey.startedAt; }
-function journeyProcessing(journey: LprJourney) { return journey.visits.reduce((sum, visit) => sum + (visit.leftAt ? stageDuration(visit) : Math.max(0, Date.now() / 1000 - visit.enteredAt)), 0); }
-function journeyWaiting(journey: LprJourney) { return journey.visits.reduce((sum, visit, index) => index ? sum + Math.max(0, visit.enteredAt - (journey.visits[index - 1].leftAt ?? journey.visits[index - 1].lastSeenAt)) : sum, 0); }
+function journeyTotal(journey: LprJourney, now = Date.now() / 1000) { return Math.max(0, (journey.completedAt ?? now) - journey.startedAt); }
+function journeyProcessing(journey: LprJourney) { return journey.visits.reduce((sum, visit) => sum + stageDuration(visit), 0); }
+function journeyWaiting(journey: LprJourney, now = Date.now() / 1000) {
+  const betweenVisits = journey.visits.reduce((sum, visit, index) => index
+    ? sum + Math.max(0, visit.enteredAt - (journey.visits[index - 1].leftAt ?? journey.visits[index - 1].lastSeenAt))
+    : sum, 0);
+  const lastVisit = journey.visits[journey.visits.length - 1];
+  const awaitingNextStation = journey.status === 'active' && lastVisit?.leftAt
+    ? Math.max(0, now - lastVisit.leftAt)
+    : 0;
+  return betweenVisits + awaitingNextStation;
+}
 function journeyWorker(journey: LprJourney, key: 'workingSeconds' | 'idleSeconds' | 'absentSeconds') { return journey.visits.reduce((sum, visit) => sum + visit[key], 0); }
+
+function useLifecycleClock() {
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
 
 function LifecycleMapping({ process }: { process: LprProcess }) {
   const vision = useVision();
@@ -658,7 +741,7 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
   };
 
   return <div className="lm-stack setup-lifecycle-step">
-    <div className="lm-page-head"><div><span>Setup <ArrowRight size={12} /> Station Mapping</span><h2>Build the vehicle journey</h2><p>Add, rename, reorder, map or remove stations manually. Existing station IDs remain stable.</p></div><button className="lm-primary" type="button" onClick={() => void saveAndStart()}><Play size={15} />Save mapping</button></div>
+    <div className="lm-setup-toolbar"><p>Add, rename, reorder, map or remove stations manually. Existing station IDs remain stable.</p><button className="lm-primary" type="button" onClick={() => void saveAndStart()}><Play size={15} />Save mapping</button></div>
     {notice ? <div className={`inline-status ${noticeTone}`}>{noticeTone === 'success' ? <Check size={15} /> : <AlertTriangle size={15} />}<span><strong>{noticeTone === 'success' ? 'Lifecycle setup saved' : 'Lifecycle setup needs attention'}</strong><small>{notice}</small></span></div> : null}
     {!lprModel?.installed ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Indian LPR is unavailable</strong><small>The worker does not have the external Indian_LPR checkout and required weights. A visible plate box without recognized OCR text cannot create a vehicle lifecycle.</small></span></div> : null}
     <section className="lm-card lm-add-station">
@@ -672,6 +755,10 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
 
 function LifecycleTracking({ process, openSummary }: { process: LprProcess; openSummary: (journey: LprJourney) => void }) {
   const lpr = useLpr();
+  const now = useLifecycleClock();
+  // Keep elapsed, delayed, and missed-exit states current even when no camera
+  // frame or user interaction causes another render.
+  void now;
   const [query, setQuery] = useState('');
   const [station, setStation] = useState('');
   const [status, setStatus] = useState('');
@@ -697,8 +784,9 @@ function LifecycleTracking({ process, openSummary }: { process: LprProcess; open
 
 function LifecycleSummary({ process, journey, back }: { process: LprProcess; journey?: LprJourney; back: () => void }) {
   const lpr = useLpr();
+  const now = useLifecycleClock();
   if (!journey) return <div className="lm-card lm-empty lm-summary-empty"><Car size={34} /><h2>No journey selected</h2><p>Open Lifecycle Tracking and select a vehicle.</p><button className="lm-primary" onClick={back} type="button">Back to Tracking</button></div>;
-  const total = journeyTotal(journey); const processing = journeyProcessing(journey); const waiting = journeyWaiting(journey); const working = journeyWorker(journey, 'workingSeconds'); const idle = journeyWorker(journey, 'idleSeconds');
+  const total = journeyTotal(journey, now); const processing = journeyProcessing(journey); const waiting = journeyWaiting(journey, now); const working = journeyWorker(journey, 'workingSeconds'); const idle = journeyWorker(journey, 'idleSeconds');
   const correctPlate = () => {
     const next = window.prompt('Correct vehicle number', journey.plate);
     if (next && normalizePlate(next)) lpr.updateJourneyPlate(journey.id, next);
@@ -755,7 +843,7 @@ function LifecyclePlateStatus({ process }: { process: LprProcess }) {
   const lpr = useLpr();
   const candidates = lpr.plateCandidates.filter((candidate) => candidate.processId === process.id);
   if (!candidates.length) return null;
-  return <section className="lm-card lm-plate-readings"><header><ScanLine size={18} /><div><h3>Live Plate Recognition</h3><p>The first valid entry-camera detection is cropped, recognized and stored. Later mapped-camera readings and the saved image keep the same vehicle linked.</p></div></header><div>{candidates.map((candidate) => { const stage = process.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>Captured and stored</strong><small>{stage?.name ?? 'Unmapped station'} · OCR {candidate.plate} · {candidate.observations} linked reading{candidate.observations === 1 ? '' : 's'}</small><i><b style={{ width: '100%' }} /></i></span></article>; })}</div></section>;
+  return <section className="lm-card lm-plate-readings"><header><ScanLine size={18} /><div><h3>Live Plate Recognition</h3><p>Only detections inside the Number Plate Zone are considered; two matching OCR reads confirm the vehicle identity.</p></div></header><div>{candidates.map((candidate) => { const stage = process.stages.find((item) => item.id === candidate.stageId); return <article key={candidate.key}>{candidate.plateImage ? <img className="lm-candidate-image" src={candidate.plateImage} alt={candidate.plate} /> : <span className="plate-badge">{candidate.plate}</span>}<span><strong>{candidate.confirmed ? 'Captured and stored' : 'Verifying OCR'}</strong><small>{stage?.name ?? 'Unmapped station'} · OCR {candidate.plate} · {Math.min(2, candidate.matchingReads)}/2 matching reads</small><i><b style={{ width: `${candidate.confirmed ? 100 : 50}%` }} /></i></span></article>; })}</div></section>;
 }
 
 type LifecycleWorkspaceSection = 'tracking' | 'mapping' | 'automations';

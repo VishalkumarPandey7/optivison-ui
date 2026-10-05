@@ -210,6 +210,8 @@ export interface AnalysisFrame {
   rules: RuleState[];
   outputs: string[];
   modelErrors: Array<{ modelId: string; error: string }>;
+  receivedAt?: number;
+  sourceImage?: string;
   error?: string;
 }
 
@@ -493,6 +495,22 @@ function isZoneDrawn(zone: Zone) {
   return zone.width > 0.5 && zone.height > 0.5;
 }
 
+function isExplicitPlateZone(zone: Zone) {
+  return isZoneDrawn(zone)
+    && /plate|lpr|number/i.test(`${zone.id} ${zone.name} ${zone.kind}`);
+}
+
+function detectionOverlapRatio(box: [number, number, number, number], zone: Zone, width: number, height: number) {
+  const [left, top, right, bottom] = box;
+  const zoneLeft = zone.coordinateSpace === 'percent' ? zone.x / 100 * width : zone.x;
+  const zoneTop = zone.coordinateSpace === 'percent' ? zone.y / 100 * height : zone.y;
+  const zoneWidth = zone.coordinateSpace === 'percent' ? zone.width / 100 * width : zone.width;
+  const zoneHeight = zone.coordinateSpace === 'percent' ? zone.height / 100 * height : zone.height;
+  const intersection = Math.max(0, Math.min(right, zoneLeft + zoneWidth) - Math.max(left, zoneLeft))
+    * Math.max(0, Math.min(bottom, zoneTop + zoneHeight) - Math.max(top, zoneTop));
+  return intersection / Math.max(1, (right - left) * (bottom - top));
+}
+
 function lineIsDrawn(line: CountingLine) {
   return Math.abs(line.start.x - line.end.x) + Math.abs(line.start.y - line.end.y) > 0.5;
 }
@@ -507,11 +525,18 @@ function plateVisualEvidence(source: HTMLCanvasElement, box: [number, number, nu
   hashCanvas.width = 9; hashCanvas.height = 8;
   const hashContext = hashCanvas.getContext('2d', { willReadFrequently: true });
   const imageCanvas = document.createElement('canvas');
-  imageCanvas.width = 188; imageCanvas.height = 48;
+  // Keep the actual analyzed crop instead of reducing every plate to a
+  // 188 x 48 thumbnail. Small crops may still be enlarged for legibility,
+  // but detailed crops retain all pixels captured by the analysis frame.
+  const previewScale = Math.max(1, Math.min(2, 188 / width, 48 / height));
+  imageCanvas.width = Math.max(1, Math.round(width * previewScale));
+  imageCanvas.height = Math.max(1, Math.round(height * previewScale));
   const imageContext = imageCanvas.getContext('2d');
   if (!hashContext || !imageContext) return {};
+  imageContext.imageSmoothingEnabled = true;
+  imageContext.imageSmoothingQuality = 'high';
   hashContext.drawImage(source, left, top, width, height, 0, 0, 9, 8);
-  imageContext.drawImage(source, left, top, width, height, 0, 0, 188, 48);
+  imageContext.drawImage(source, left, top, width, height, 0, 0, imageCanvas.width, imageCanvas.height);
   const pixels = hashContext.getImageData(0, 0, 9, 8).data;
   let bits = '';
   for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
@@ -523,7 +548,7 @@ function plateVisualEvidence(source: HTMLCanvasElement, box: [number, number, nu
   }
   let fingerprint = '';
   for (let index = 0; index < bits.length; index += 4) fingerprint += Number.parseInt(bits.slice(index, index + 4), 2).toString(16);
-  return { plateFingerprint: fingerprint, plateImage: imageCanvas.toDataURL('image/jpeg', .72) };
+  return { plateFingerprint: fingerprint, plateImage: imageCanvas.toDataURL('image/jpeg', .92) };
 }
 
 const VisionContext = createContext<VisionContextValue | null>(null);
@@ -925,7 +950,10 @@ export function VisionProvider({ children }: { children: ReactNode }) {
         lastAnalysisStarted.current[camera.id] = performance.now();
         void (async () => {
           try {
-            const maxWidth = 960;
+            const config = camera.configuration;
+            const maxWidth = config.selectedModelIds.includes('indian_lpr')
+              ? visionRuntimeConfig.lprAnalysisMaxWidth
+              : visionRuntimeConfig.analysisMaxWidth;
             const scale = Math.min(1, maxWidth / video.videoWidth);
             const canvas = canvasRefs.current[camera.id] ?? document.createElement('canvas');
             canvasRefs.current[camera.id] = canvas;
@@ -934,13 +962,13 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             const context = canvas.getContext('2d');
             if (!context) return;
             context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const config = camera.configuration;
             const drawnZones = config.zones.filter(isZoneDrawn);
             const drawnIds = new Set(drawnZones.map((zone) => zone.id));
             const activeAnalysisRoiIds = config.analysisRoiIds.filter((id) => drawnIds.has(id));
             const signals = config.signals.map((signal) => ({ ...signal, analysisEnabled: !signal.zoneId || drawnIds.has(signal.zoneId) }));
             const enabledSignalIds = new Set(signals.filter((signal) => signal.analysisEnabled).map((signal) => signal.id));
             const rules = config.rules.map((rule) => ({ ...rule, analysisEnabled: rule.conditions.every((condition) => enabledSignalIds.has(condition.signalId)) }));
+            const analysisImage = canvas.toDataURL('image/jpeg', visionRuntimeConfig.analysisJpegQuality);
             const response = await requestJson<AnalysisFrame>('/analyze', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
@@ -949,7 +977,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
                 cameraName: camera.name,
                 frame: frameNumbers.current[camera.id] = (frameNumbers.current[camera.id] ?? 0) + 1,
                 timestamp: Date.now() / 1000,
-                image: canvas.toDataURL('image/jpeg', 0.78),
+                image: analysisImage,
                 confidence: config.confidence,
                 modelIds: config.selectedModelIds,
                 classNames: requiredClasses(config.signals),
@@ -965,9 +993,16 @@ export function VisionProvider({ children }: { children: ReactNode }) {
                 rules
               })
             });
-            response.detections = response.detections.map((detection) => detection.className === 'license_plate'
+            const plateZones = drawnZones.filter(isExplicitPlateZone);
+            response.detections = response.detections
+              .filter((detection) => detection.className !== 'license_plate' || !plateZones.length || plateZones.some((zone) => (
+                detectionOverlapRatio(detection.box, zone, response.width, response.height) >= config.minimumRoiOverlap
+              )))
+              .map((detection) => detection.className === 'license_plate'
               ? { ...detection, ...plateVisualEvidence(canvas, detection.box) }
               : detection);
+            response.receivedAt = Date.now() / 1000;
+            response.sourceImage = analysisImage;
             setFrames((current) => ({ ...current, [camera.id]: response }));
             const previous = new Set(lastOutputs.current[camera.id] ?? []);
             const freshOutputs = response.outputs.filter((output) => !previous.has(output));
@@ -997,6 +1032,13 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             const message = error instanceof Error ? error.message : 'Frame analysis failed.';
             const timestamp = Date.now() / 1000;
             const previousError = lastErrorEvents.current[camera.id];
+            // Never leave boxes from an old video frame floating over a feed
+            // that has continued playing after an analysis failure/timeout.
+            setFrames((current) => {
+              const previousFrame = current[camera.id];
+              if (!previousFrame?.detections.length) return current;
+              return { ...current, [camera.id]: { ...previousFrame, detections: [] } };
+            });
             if (camera.error !== message) updateCamera(camera.id, { error: message });
             if (!previousError || previousError.message !== message || timestamp - previousError.timestamp >= 30) {
               lastErrorEvents.current[camera.id] = { message, timestamp };

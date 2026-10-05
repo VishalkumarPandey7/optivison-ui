@@ -247,11 +247,15 @@ function EmptyFeed({
   const vision = useVision();
   const camera = vision.getCamera(cameraId);
   const frame = vision.frames[camera.id];
+  // Inference runs independently from playback and may take several seconds
+  // on CPU. Keep results briefly visible over the live feed, but never replace
+  // the moving video with the captured analysis frame.
+  const displayedFrame = frame && Date.now() / 1000 - (frame.receivedAt ?? frame.timestamp) <= 2 ? frame : undefined;
   const [playback, setPlayback] = useState({ current: 0, duration: 0 });
   const sourceReady = camera.sourceStatus === 'ready';
   const display = camera.configuration.display;
   const setVideoNode = useCallback((node: HTMLVideoElement | null) => vision.setVideoElement(camera.id, node), [camera.id, vision.setVideoElement]);
-  const countSignal = frame?.signals.find((signal) => signal.kind === 'line_crossing_count');
+  const countSignal = displayedFrame?.signals.find((signal) => signal.kind === 'line_crossing_count');
   const displayZones = camera.configuration.zones.filter((zone) => zone.width > 0.5 && zone.height > 0.5);
   const displayLines = camera.configuration.countingLines.filter((line) => Math.abs(line.end.x - line.start.x) + Math.abs(line.end.y - line.start.y) > 0.5);
   return (
@@ -286,13 +290,13 @@ function EmptyFeed({
       {draftZone && Number(draftZone.width) > 0 ? <div className="live-zone draft" style={{ left: `${draftZone.x}%`, top: `${draftZone.y}%`, width: `${draftZone.width}%`, height: `${draftZone.height}%` }} /> : null}
       {displayLines.map((line) => <svg className="live-count-line" key={line.id} viewBox="0 0 100 100" preserveAspectRatio="none"><line x1={line.start.x} y1={line.start.y} x2={line.end.x} y2={line.end.y} /></svg>)}
       {draftLine ? <svg className="live-count-line draft" viewBox="0 0 100 100" preserveAspectRatio="none"><line x1={draftLine.start.x} y1={draftLine.start.y} x2={draftLine.end.x} y2={draftLine.end.y} /></svg> : null}
-      {display.boundingBoxes ? frame?.detections.map((detection) => {
+      {display.boundingBoxes ? displayedFrame?.detections.map((detection) => {
         const [left, top, right, bottom] = detection.box;
         const label = [display.labels ? (detection.plateText ? `PLATE ${detection.plateText}` : detection.className.toUpperCase()) : '', display.trackIds && !detection.plateText ? `#${detection.trackId}` : '', display.confidence ? `${Math.round(detection.confidence * 100)}%` : ''].filter(Boolean).join(' · ');
-        return <div className="live-detection" key={detection.id} style={{ left: `${left / frame.width * 100}%`, top: `${top / frame.height * 100}%`, width: `${(right - left) / frame.width * 100}%`, height: `${(bottom - top) / frame.height * 100}%`, borderColor: display.detectionColor, borderWidth: `${display.boxThickness}px` }}>{label ? <span style={{ background: display.detectionColor }}>{label}</span> : null}</div>;
+        return <div className="live-detection" key={detection.id} style={{ left: `${left / displayedFrame.width * 100}%`, top: `${top / displayedFrame.height * 100}%`, width: `${(right - left) / displayedFrame.width * 100}%`, height: `${(bottom - top) / displayedFrame.height * 100}%`, borderColor: display.detectionColor, borderWidth: `${display.boxThickness}px` }}>{label ? <span style={{ background: display.detectionColor }}>{label}</span> : null}</div>;
       }) : null}
       {countSignal ? <div className="live-count-badge"><small>OBJECTS PASSED</small><strong>{Number(countSignal.evidence.totalCount ?? countSignal.value ?? 0)}</strong></div> : null}
-      {sourceReady && !frame && vision.running[camera.id] ? <div className="feed-waiting">Waiting for the first analyzed frame…</div> : null}
+      {sourceReady && !displayedFrame && vision.running[camera.id] ? <div className="feed-waiting">Waiting for the current analyzed frame…</div> : null}
       {camera.error ? <div className="feed-error">{camera.error}</div> : null}
       <span className="feed-time">{camera.sourceType === 'uploaded' ? `VIDEO ${Math.floor(playback.current / 60)}:${String(Math.floor(playback.current % 60)).padStart(2, '0')} / ${Math.floor(playback.duration / 60)}:${String(Math.floor(playback.duration % 60)).padStart(2, '0')}` : new Date((frame?.timestamp ?? Date.now() / 1000) * 1000).toLocaleString()}</span>
     </div>

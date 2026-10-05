@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from threading import RLock
@@ -29,6 +30,20 @@ def _overlap_ratio(box: list[int], zone: dict[str, Any], width: int, height: int
     intersection = max(0.0, min(right, zone_right) - max(left, zone_left)) * max(0.0, min(bottom, zone_bottom) - max(top, zone_top))
     area = max(1.0, float((right - left) * (bottom - top)))
     return intersection / area
+
+
+def _explicit_plate_zones(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return drawn ROIs that explicitly identify the LPR capture area."""
+    return [
+        zone
+        for zone in zones
+        if float(zone.get("width", 0)) > 0.5
+        and float(zone.get("height", 0)) > 0.5
+        and any(
+            token in f'{zone.get("id", "")} {zone.get("name", "")} {zone.get("kind", "")}'.lower()
+            for token in ("plate", "lpr", "number")
+        )
+    ]
 
 
 class IndianLprRuntime:
@@ -103,7 +118,7 @@ class IndianLprRuntime:
         """
         height, width = image.shape[:2]
         drawn = [zone for zone in zones if float(zone.get("width", 0)) > 0.5 and float(zone.get("height", 0)) > 0.5]
-        named = [zone for zone in drawn if any(token in f'{zone.get("id", "")} {zone.get("name", "")}'.lower() for token in ("plate", "lpr", "number"))]
+        named = _explicit_plate_zones(zones)
         selected = named or drawn
         views: list[tuple[np.ndarray, float, int, int]] = []
         for zone in selected:
@@ -114,9 +129,8 @@ class IndianLprRuntime:
             crop = image[top:bottom, left:right]
             if crop.size == 0:
                 continue
-            scale = min(3.0, 1600.0 / max(crop.shape[:2]))
-            if scale < 1.25:
-                continue
+            zone_coverage = (crop.shape[0] * crop.shape[1]) / max(1, height * width)
+            scale = 1.0 if zone_coverage >= 0.9 else max(1.0, min(3.0, 1600.0 / max(crop.shape[:2])))
             enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             views.append((enlarged, scale, left, top))
         return views
@@ -125,9 +139,18 @@ class IndianLprRuntime:
         with self._lock:
             self._load()
             height, width = image.shape[:2]
+            plate_zones = _explicit_plate_zones(zones)
+            plate_zone_ids = {str(zone.get("id")) for zone in plate_zones}
             crops: list[torch.Tensor] = []
             usable: list[tuple[list[int], float]] = []
-            views: list[tuple[np.ndarray, float, int, int]] = [(image, 1.0, 0, 0)]
+            # A configured Number Plate Zone is the detector input, not merely
+            # a post-detection filter. This prevents an easier plate elsewhere
+            # in the frame from winning and lowers LPR latency substantially.
+            views: list[tuple[np.ndarray, float, int, int]] = (
+                self._plate_zone_views(image, zones)
+                if plate_zones
+                else [(image, 1.0, 0, 0)]
+            )
             for view, scale, offset_x, offset_y in views:
                 raw_boxes, raw_scores = self._detect(view)
                 for raw_box, score in zip(raw_boxes, raw_scores):
@@ -143,6 +166,14 @@ class IndianLprRuntime:
                     ]
                     if box[2] <= box[0] or box[3] <= box[1] or any(_box_iou(box, existing[0]) >= 0.65 for existing in usable):
                         continue
+                    # Gate detections before accepting a crop. Otherwise a
+                    # clearer plate elsewhere in the full frame prevents the
+                    # enlarged plate-zone fallback from ever running.
+                    if plate_zones and not any(
+                        _overlap_ratio(box, zone, width, height) >= minimum_roi_overlap
+                        for zone in plate_zones
+                    ):
+                        continue
                     crop = view[view_box[1]:view_box[3], view_box[0]:view_box[2], :]
                     if crop.size == 0:
                         continue
@@ -152,8 +183,6 @@ class IndianLprRuntime:
                     usable.append((box, float(score)))
                 if usable:
                     break
-                if len(views) == 1:
-                    views.extend(self._plate_zone_views(image, zones))
             if not crops:
                 return []
             labels = self._decode(self._recognizer, torch.stack(crops, 0))
@@ -162,7 +191,17 @@ class IndianLprRuntime:
                 plate = "".join(character for character in str(label).upper() if character.isalnum() or character == "-")
                 if len(plate) < 4:
                     continue
+                normalized_plate = plate.replace("-", "")
+                standard_indian_plate = re.fullmatch(r"[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}", normalized_plate)
+                bharat_series_plate = re.fullmatch(r"\d{2}BH\d{4}[A-Z]{1,2}", normalized_plate)
+                if not standard_indian_plate and not bharat_series_plate:
+                    continue
                 zone_ids = [str(zone.get("id")) for zone in zones if _overlap_ratio(box, zone, width, height) >= minimum_roi_overlap]
+                # A specifically named Number Plate/LPR zone is an explicit
+                # capture boundary, not only a visual overlay. Keep whole-frame
+                # behavior when no such zone has been configured.
+                if plate_zone_ids and not plate_zone_ids.intersection(zone_ids):
+                    continue
                 results.append({
                     "id": f"lpr-{plate}-{index}",
                     "trackId": plate,

@@ -7,6 +7,9 @@ type ViteImportMeta = ImportMeta & {
     VITE_OPTIVISION_REQUEST_TIMEOUT_MS?: string;
     VITE_OPTIVISION_ANALYSIS_INTERVAL_MS?: string;
     VITE_OPTIVISION_MAX_CONCURRENT_ANALYSES?: string;
+    VITE_OPTIVISION_ANALYSIS_MAX_WIDTH?: string;
+    VITE_OPTIVISION_LPR_ANALYSIS_MAX_WIDTH?: string;
+    VITE_OPTIVISION_ANALYSIS_JPEG_QUALITY?: string;
   };
 };
 
@@ -18,11 +21,19 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
   return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback;
 }
 
+function boundedNumber(value: string | undefined, fallback: number, minimum: number, maximum: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
+}
+
 export const workerUrl = (configuredWorkerUrl || DEFAULT_WORKER_URL).replace(/\/$/, '');
 export const visionRuntimeConfig = {
   requestTimeoutMs: boundedInteger(runtimeEnv?.VITE_OPTIVISION_REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 1_000, 120_000),
   analysisIntervalMs: boundedInteger(runtimeEnv?.VITE_OPTIVISION_ANALYSIS_INTERVAL_MS, 500, 200, 10_000),
   maxConcurrentAnalyses: boundedInteger(runtimeEnv?.VITE_OPTIVISION_MAX_CONCURRENT_ANALYSES, 2, 1, 7),
+  analysisMaxWidth: boundedInteger(runtimeEnv?.VITE_OPTIVISION_ANALYSIS_MAX_WIDTH, 1280, 640, 3840),
+  lprAnalysisMaxWidth: boundedInteger(runtimeEnv?.VITE_OPTIVISION_LPR_ANALYSIS_MAX_WIDTH, 1920, 640, 3840),
+  analysisJpegQuality: boundedNumber(runtimeEnv?.VITE_OPTIVISION_ANALYSIS_JPEG_QUALITY, 0.9, 0.5, 1),
 } as const;
 
 export interface WorkerRequestOptions extends RequestInit {
