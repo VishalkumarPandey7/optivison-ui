@@ -5,7 +5,7 @@ import { backupStoredValue, isArray, readStoredJson, readStoredString, writeStor
 import { migrateLifecycleAutomations, migrateLprProcesses, type MigratedLifecycleAutomation } from './state/migrations';
 
 type StageType = 'entry' | 'station' | 'exit';
-type WorkerState = 'working' | 'idle' | 'absent';
+type WorkerState = 'working' | 'idle' | 'absent' | 'unknown';
 
 export interface LprStage {
   id: string;
@@ -34,14 +34,17 @@ export interface LprVisit {
   enteredAt: number;
   lastSeenAt: number;
   leftAt?: number;
+  presenceLostAt?: number;
+  workStartedAt?: number;
   workingSeconds: number;
   idleSeconds: number;
   absentSeconds: number;
+  unknownSeconds?: number;
 }
 
 export interface LprEvent {
   id: string;
-  type: 'vehicle_entered' | 'vehicle_left' | 'work_started' | 'work_stopped' | 'work_resumed' | 'worker_absent' | 'journey_started' | 'journey_completed';
+  type: 'vehicle_entered' | 'vehicle_left' | 'plate_signal_lost' | 'work_started' | 'work_stopped' | 'work_resumed' | 'worker_absent' | 'journey_started' | 'journey_completed';
   stageId: string;
   timestamp: number;
   detail: string;
@@ -201,7 +204,7 @@ function defaultProcess(cameraId: string, plantId: string, zoneIds: string[]): L
   const stations = ['Main Gate', 'Reception', 'Inspection Bay', 'Service Bay 1', 'QC', 'Washing', 'Delivery Yard', 'Exit Gate'];
   return {
     id: 'vehicle-service-flow', name: 'Vehicle Lifecycle', plantId, modelId: 'indian_lpr', active: true,
-    flowMode: 'strict', minimumTransitionSeconds: 2, staleAfterMinutes: 30,
+    flowMode: 'flexible', minimumTransitionSeconds: 2, staleAfterMinutes: 30,
     stages: stations.map((name, index) => ({
       id: `station-${index + 1}`,
       order: index,
@@ -234,9 +237,11 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
     stageId: stage.id,
     enteredAt: firstObservedAt,
     lastSeenAt: timestamp,
+    workStartedAt: stage.trackWorker && workerState === 'working' ? firstObservedAt : undefined,
     workingSeconds: stage.trackWorker && workerState === 'working' ? initialObservedSeconds : 0,
     idleSeconds: stage.trackWorker && workerState === 'idle' ? initialObservedSeconds : 0,
-    absentSeconds: stage.trackWorker && workerState === 'absent' ? initialObservedSeconds : 0
+    absentSeconds: stage.trackWorker && workerState === 'absent' ? initialObservedSeconds : 0,
+    unknownSeconds: stage.trackWorker && workerState === 'unknown' ? initialObservedSeconds : 0
   });
   const matchingJourneys = current
     .map((journey, index) => ({ journey, index }))
@@ -267,22 +272,23 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
     const activeVisit = openVisit(journey, journey.currentStageId);
     const currentStageIndex = process.stages.findIndex((item) => item.id === journey.currentStageId);
     const observedStageIndex = process.stages.findIndex((item) => item.id === stage.id);
-    // The entry-camera OCR creates the journey immediately. Once it exists,
-    // the selected flow mode controls how downstream station scans advance it.
+    // The entry-camera OCR creates the journey immediately. Downstream mapped
+    // stations may be skipped, but an older station may not move it backward.
     if (observedStageIndex >= 0 && currentStageIndex >= 0 && observedStageIndex < currentStageIndex) return current;
-    const mappedStages = process.stages.filter((item) => item.cameraId);
-    const currentMappedIndex = mappedStages.findIndex((item) => item.id === journey.currentStageId);
-    const observedMappedIndex = mappedStages.findIndex((item) => item.id === stage.id);
-    if (journey.currentStageId !== stage.id && process.flowMode !== 'flexible' && observedMappedIndex !== currentMappedIndex + 1) return current;
     const lastVisit = journey.visits[journey.visits.length - 1];
     if (journey.currentStageId !== stage.id && firstObservedAt - lastVisit.enteredAt < (process.minimumTransitionSeconds ?? 2)) return current;
     if (journey.currentStageId !== stage.id) {
-      if (activeVisit) { activeVisit.leftAt = activeVisit.lastSeenAt; journey.events.push(event('vehicle_left', activeVisit.stageId, activeVisit.lastSeenAt, `${journey.plate} left previous zone`)); }
+      if (activeVisit) {
+        // A disappearing plate only means OCR visibility was lost. The next
+        // confirmed station is the first reliable proof that the vehicle left.
+        activeVisit.leftAt = firstObservedAt;
+        journey.events.push(event('vehicle_left', activeVisit.stageId, firstObservedAt, `${journey.plate} left the previous station before arriving at ${stage.name}`));
+      }
       journey.currentStageId = stage.id;
       journey.workerState = workerState;
       journey.visits.push(initialVisit());
       journey.events.push(event('vehicle_entered', stage.id, firstObservedAt, `${journey.plate} entered ${stage.name}`));
-      if (stage.trackWorker) {
+      if (stage.trackWorker && workerState !== 'unknown') {
         const type = workerState === 'working' ? 'work_started' : workerState === 'absent' ? 'worker_absent' : 'work_stopped';
         journey.events.push(event(type, stage.id, timestamp, `Worker ${workerState} at ${stage.name}`));
       }
@@ -293,12 +299,15 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
       const delta = Math.max(0, Math.min(consecutiveFrameToleranceSeconds, timestamp - activeVisit.lastSeenAt));
       if (journey.workerState === 'working') activeVisit.workingSeconds += delta;
       else if (journey.workerState === 'idle') activeVisit.idleSeconds += delta;
-      else activeVisit.absentSeconds += delta;
+      else if (journey.workerState === 'absent') activeVisit.absentSeconds += delta;
+      else activeVisit.unknownSeconds = (activeVisit.unknownSeconds ?? 0) + delta;
       activeVisit.lastSeenAt = timestamp;
+      activeVisit.presenceLostAt = undefined;
       if (stage.trackWorker && workerState !== journey.workerState) {
         const prior = journey.workerState;
+        if (workerState === 'working') activeVisit.workStartedAt ??= timestamp;
         const type = workerState === 'working' ? (prior === 'idle' ? 'work_resumed' : 'work_started') : workerState === 'absent' ? 'worker_absent' : 'work_stopped';
-        journey.events.push(event(type, stage.id, timestamp, `Worker ${workerState} at ${stage.name}`));
+        if (workerState !== 'unknown') journey.events.push(event(type, stage.id, timestamp, `Worker ${workerState} at ${stage.name}`));
         journey.workerState = workerState;
       }
     }
@@ -316,7 +325,8 @@ function observeJourney(current: LprJourney[], process: LprProcess, stage: LprSt
 function workerStateFromFrame(frame: AnalysisFrame): WorkerState {
   if (frame.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active)) return 'working';
   if (frame.rules.some((rule) => rule.output === 'OPERATOR_ABSENT' && rule.active)) return 'absent';
-  return 'idle';
+  if (frame.rules.some((rule) => rule.output === 'WORKER_IDLE' && rule.active)) return 'idle';
+  return 'unknown';
 }
 
 function closeExpiredCandidateVisits(current: LprJourney[], expiredCandidates: LprCandidate[], processes: LprProcess[]) {
@@ -326,10 +336,10 @@ function closeExpiredCandidateVisits(current: LprJourney[], expiredCandidates: L
     const copy = structuredClone(journey);
     const visit = openVisit(copy, candidate.stageId);
     if (!visit) return journey;
-    visit.leftAt = candidate.lastSeen;
-    visit.lastSeenAt = candidate.lastSeen;
+    if (visit.presenceLostAt) return journey;
+    visit.presenceLostAt = candidate.lastSeen;
     const stage = processes.find((process) => process.id === candidate.processId)?.stages.find((item) => item.id === candidate.stageId);
-    copy.events.push(event('vehicle_left', candidate.stageId, candidate.lastSeen, `${copy.plate} left ${stage?.name ?? 'station'}`));
+    copy.events.push(event('plate_signal_lost', candidate.stageId, candidate.lastSeen, `${copy.plate} is no longer visible at ${stage?.name ?? 'station'}; station exit is not confirmed`));
     return copy;
   }), current);
 }
@@ -533,7 +543,7 @@ function duration(seconds: number) {
   return `${Math.floor(total / 3600)}h ${Math.floor(total % 3600 / 60)}m ${total % 60}s`;
 }
 
-function stageDuration(visit: LprVisit) { return Math.max(0, (visit.leftAt ?? visit.lastSeenAt) - visit.enteredAt); }
+function stageDuration(visit: LprVisit, now = Date.now() / 1000) { return Math.max(0, (visit.leftAt ?? now) - visit.enteredAt); }
 
 export function LegacyLprPage() {
   const vision = useVision();
@@ -602,18 +612,27 @@ function shortDuration(seconds: number) {
 }
 
 function journeyTotal(journey: LprJourney, now = Date.now() / 1000) { return Math.max(0, (journey.completedAt ?? now) - journey.startedAt); }
-function journeyProcessing(journey: LprJourney) { return journey.visits.reduce((sum, visit) => sum + stageDuration(visit), 0); }
-function journeyWaiting(journey: LprJourney, now = Date.now() / 1000) {
-  const betweenVisits = journey.visits.reduce((sum, visit, index) => index
-    ? sum + Math.max(0, visit.enteredAt - (journey.visits[index - 1].leftAt ?? journey.visits[index - 1].lastSeenAt))
-    : sum, 0);
-  const lastVisit = journey.visits[journey.visits.length - 1];
-  const awaitingNextStation = journey.status === 'active' && lastVisit?.leftAt
-    ? Math.max(0, now - lastVisit.leftAt)
-    : 0;
-  return betweenVisits + awaitingNextStation;
+function journeyWorker(journey: LprJourney, key: 'workingSeconds' | 'idleSeconds' | 'absentSeconds' | 'unknownSeconds') { return journey.visits.reduce((sum, visit) => sum + (visit[key] ?? 0), 0); }
+// Processing means time with an explicit WORKER_WORKING signal. It intentionally
+// excludes idle, absent, and missing-signal time instead of treating all station
+// dwell as productive work.
+function journeyProcessing(journey: LprJourney) { return journeyWorker(journey, 'workingSeconds'); }
+function visitWaiting(visit: LprVisit, stage: LprStage | undefined, now = Date.now() / 1000) {
+  if (!stage?.trackWorker) return 0;
+  return Math.max(0, Math.min(visit.leftAt ?? now, visit.workStartedAt ?? (visit.leftAt ?? now)) - visit.enteredAt);
 }
-function journeyWorker(journey: LprJourney, key: 'workingSeconds' | 'idleSeconds' | 'absentSeconds') { return journey.visits.reduce((sum, visit) => sum + visit[key], 0); }
+function journeyWaiting(journey: LprJourney, process: LprProcess, now = Date.now() / 1000) {
+  return journey.visits.reduce((sum, visit) => sum + visitWaiting(visit, process.stages.find((stage) => stage.id === visit.stageId), now), 0);
+}
+function journeyTransit(journey: LprJourney) {
+  return journey.visits.reduce((sum, visit, index) => index
+    ? sum + Math.max(0, visit.enteredAt - (journey.visits[index - 1].leftAt ?? visit.enteredAt))
+    : sum, 0);
+}
+function localDateKey(timestamp: number) {
+  const value = new Date(timestamp * 1000);
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+}
 
 function useLifecycleClock() {
   const [now, setNow] = useState(() => Date.now() / 1000);
@@ -621,7 +640,7 @@ function useLifecycleClock() {
     const timer = window.setInterval(() => setNow(Date.now() / 1000), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  return now;
+  return { now, refresh: () => setNow(Date.now() / 1000) };
 }
 
 function LifecycleMapping({ process }: { process: LprProcess }) {
@@ -749,26 +768,35 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
       <div><label><span>Station name *</span><input placeholder="Example: Paint Booth" value={newStationName} onChange={(event) => setNewStationName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') addStation(); }} /></label><label><span>Camera feed</span><select value={newStationCameraId} onChange={(event) => setNewStationCameraId(event.target.value)}><option value="">Assign camera later</option>{availableCameras.map((camera) => { const assignedStage = process.stages.find((stage) => stage.cameraId === camera.id); const plant = vision.plants.find((candidate) => candidate.id === camera.plantId); const cameraName = camera.name.trim() || camera.id; return <option disabled={Boolean(assignedStage)} key={camera.id} value={camera.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></label><label><span>Station role</span><select value={newStationType} onChange={(event) => setNewStationType(event.target.value as StageType)}><option value="station">Normal station</option><option value="entry">Start station</option><option value="exit">End station</option></select></label><button className="lm-primary" onClick={addStation} type="button"><Plus size={15} />Add station</button></div>
       <small>Only one Start and one End station are active. Choosing either role here changes the previous boundary station back to a normal station.</small>
     </section>
-    <section className="lm-card lm-mapping"><header><Route size={20} /><div><h3>Ordered stations</h3><p>Choose one start and one end station. Each camera can be used once; its plant is shown so entry and exit cameras can be mapped across sites.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Order</th><th>Station name</th><th>Camera</th><th>Zone</th><th>Worker activity</th><th>Start</th><th>End</th><th>Actions</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); return <tr key={stage.id}><td><div className="lm-order-actions"><button disabled={index === 0} aria-label={`Move ${stage.name} earlier`} onClick={() => moveStage(stage.id, -1)} type="button"><ArrowLeft size={13} /></button><strong>{index + 1}</strong><button disabled={index === process.stages.length - 1} aria-label={`Move ${stage.name} later`} onClick={() => moveStage(stage.id, 1)} type="button"><ArrowRight size={13} /></button></div></td><td><input aria-label={`Station ${index + 1} name`} value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select aria-label={`${stage.name} camera`} value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{availableCameras.map((item) => { const assignedStage = process.stages.find((other) => other.id !== stage.id && other.cameraId === item.id); const plant = vision.plants.find((candidate) => candidate.id === item.plantId); const cameraName = item.name.trim() || item.id; return <option disabled={Boolean(assignedStage)} key={item.id} value={item.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></td><td><select aria-label={`${stage.name} zone`} disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole frame</option>{camera?.configuration.zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></td><td><button className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} aria-label={`Track worker at ${stage.name}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} start station`} checked={stage.type === 'entry'} name={`lpr-start-${process.id}`} onChange={() => setBoundary(stage.id, 'entry')} type="radio" /><i /></label></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} end station`} checked={stage.type === 'exit'} name={`lpr-end-${process.id}`} onChange={() => setBoundary(stage.id, 'exit')} type="radio" /><i /></label></td><td><button className="lm-delete-station" disabled={process.stages.length <= 2} aria-label={`Delete ${stage.name}`} onClick={() => deleteStation(stage)} type="button"><Trash2 size={14} /></button></td></tr>; })}</tbody></table></div></section>
+    <section className="lm-card lm-mapping"><header><Route size={20} /><div><h3>Ordered stations</h3><p>Choose one start and one end station. Each camera can be used once; its plant is shown so entry and exit cameras can be mapped across sites.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Order</th><th>Station name</th><th>Camera</th><th>Zone</th><th>Worker activity</th><th>Start</th><th>End</th><th>Actions</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); return <tr key={stage.id}><td><div className="lm-order-actions"><button disabled={index === 0} aria-label={`Move ${stage.name} earlier`} onClick={() => moveStage(stage.id, -1)} type="button"><ArrowLeft size={13} /></button><strong>{index + 1}</strong><button disabled={index === process.stages.length - 1} aria-label={`Move ${stage.name} later`} onClick={() => moveStage(stage.id, 1)} type="button"><ArrowRight size={13} /></button></div></td><td><input aria-label={`Station ${index + 1} name`} value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select aria-label={`${stage.name} camera`} value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{availableCameras.map((item) => { const assignedStage = process.stages.find((other) => other.id !== stage.id && other.cameraId === item.id); const plant = vision.plants.find((candidate) => candidate.id === item.plantId); const cameraName = item.name.trim() || item.id; return <option disabled={Boolean(assignedStage)} key={item.id} value={item.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></td><td><select aria-label={`${stage.name} zone`} disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole frame</option>{camera?.configuration.zones.map((zone) => { const active = camera.configuration.analysisRoiIds.includes(zone.id) && zone.width > 0 && zone.height > 0; return <option disabled={!active} key={zone.id} value={zone.id}>{zone.name}{active ? '' : ' · draw this zone first'}</option>; })}</select></td><td><button className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} aria-label={`Track worker at ${stage.name}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} start station`} checked={stage.type === 'entry'} name={`lpr-start-${process.id}`} onChange={() => setBoundary(stage.id, 'entry')} type="radio" /><i /></label></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} end station`} checked={stage.type === 'exit'} name={`lpr-end-${process.id}`} onChange={() => setBoundary(stage.id, 'exit')} type="radio" /><i /></label></td><td><button className="lm-delete-station" disabled={process.stages.length <= 2} aria-label={`Delete ${stage.name}`} onClick={() => deleteStation(stage)} type="button"><Trash2 size={14} /></button></td></tr>; })}</tbody></table></div></section>
   </div>;
 }
 
 function LifecycleTracking({ process, openSummary }: { process: LprProcess; openSummary: (journey: LprJourney) => void }) {
   const lpr = useLpr();
-  const now = useLifecycleClock();
-  // Keep elapsed, delayed, and missed-exit states current even when no camera
-  // frame or user interaction causes another render.
-  void now;
+  const { now, refresh } = useLifecycleClock();
   const [query, setQuery] = useState('');
   const [station, setStation] = useState('');
   const [status, setStatus] = useState('');
-  const journeys = lpr.journeys.filter((journey) => journey.processId === process.id);
+  const [date, setDate] = useState(() => localDateKey(Date.now() / 1000));
+  const processJourneys = lpr.journeys.filter((journey) => journey.processId === process.id);
+  const journeys = processJourneys.filter((journey) => !date || localDateKey(journey.startedAt) === date);
   const visible = journeys.filter((journey) => journey.plate.includes(query.toUpperCase()) && (!station || journey.currentStageId === station) && (!status || journey.status === status));
   const completed = journeys.filter((journey) => journey.status === 'completed');
-  const active = journeys.filter((journey) => journey.status === 'active');
+  const active = processJourneys.filter((journey) => journey.status === 'active');
+  const delayedAfterSeconds = (process.staleAfterMinutes ?? 30) * 60;
   const avg = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
   const totalWorker = journeys.reduce((sum, item) => sum + journeyWorker(item, 'workingSeconds') + journeyWorker(item, 'idleSeconds'), 0);
   const activeWorker = journeys.reduce((sum, item) => sum + journeyWorker(item, 'workingSeconds'), 0);
+  const location = (journey: LprJourney) => {
+    const visit = journey.visits[journey.visits.length - 1];
+    const stage = process.stages.find((item) => item.id === visit?.stageId);
+    if (journey.status === 'completed') return 'Exited';
+    if (visit?.leftAt) return 'Between stations';
+    return now - (visit?.lastSeenAt ?? journey.lastActivityAt) > consecutiveFrameToleranceSeconds
+      ? `Last known: ${stage?.name ?? 'Unknown'}`
+      : stage?.name ?? 'Unknown';
+  };
   const correctPlate = (journey: LprJourney) => {
     const next = window.prompt('Correct vehicle number', journey.plate);
     if (next && normalizePlate(next)) lpr.updateJourneyPlate(journey.id, next);
@@ -779,14 +807,40 @@ function LifecycleTracking({ process, openSummary }: { process: LprProcess; open
   const completeJourney = (journey: LprJourney) => {
     if (window.confirm(`Complete ${journey.plate} manually? Use this when the exit scan was missed.`)) lpr.completeJourney(journey.id);
   };
-  return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking</span><h2>Lifecycle Tracking</h2><p>Monitor detected vehicles, live station status, and reconstructed journeys.</p></div></div><section className="lm-card lm-filters"><label><span>Search Vehicles</span><div><Search size={15} /><input placeholder="Search by vehicle number..." value={query} onChange={(event) => setQuery(event.target.value)} /></div></label><label><span>Date Range</span><div><CalendarDays size={15} /><input readOnly value={new Date().toLocaleDateString()} /></div></label><label><span>Current Station</span><select value={station} onChange={(event) => setStation(event.target.value)}><option value="">All Stations</option>{process.stages.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label><span>Status</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All Status</option><option value="active">In Progress</option><option value="completed">Completed</option></select></label><button className="lm-primary" type="button"><RefreshCw size={15} />Refresh</button></section><section className="lm-tracking-kpis"><article><Car /><span><small>Vehicles Today</small><strong>{journeys.length}</strong><em>Live captured data</em></span></article><article><Clock3 /><span><small>In Progress</small><strong>{active.length}</strong><em>Currently tracked</em></span></article><article><Check /><span><small>Completed</small><strong>{completed.length}</strong><em>Exited end station</em></span></article><article><AlertTriangle /><span><small>Delayed</small><strong>{active.filter((item) => journeyTotal(item) > 7200).length}</strong><em>Over two hours</em></span></article></section><div className="lm-tracking-grid"><section className="lm-card lm-entries"><header><List size={19} /><div><h3>Detected Vehicle Entries</h3><p>Click a row to open the complete vehicle journey summary.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Vehicle Number</th><th>First Seen</th><th>Current Station</th><th>Last Captured Station</th><th>Total Elapsed</th><th>Status</th><th>Live Status</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody>{visible.map((journey) => { const stage = process.stages.find((item) => item.id === journey.currentStageId); const lastVisit = journey.visits[journey.visits.length - 1]; const stale = journey.status === 'active' && Date.now() / 1000 - (journey.lastActivityAt ?? lastVisit.lastSeenAt) > (process.staleAfterMinutes ?? 30) * 60; return <tr key={journey.id} onClick={() => openSummary(journey)}><td><strong>{journey.plate}</strong></td><td>{new Date(journey.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td>{stage?.name ?? 'Unknown'}</td><td>{stage?.name ?? 'Unknown'}</td><td>{shortDuration(journeyTotal(journey))}</td><td><span className={`lm-badge ${stale ? 'stale' : journey.status}`}>{stale ? 'Needs Review' : journey.status === 'active' ? 'In Progress' : 'Completed'}</span></td><td><span className={`lm-live ${stale ? 'orange' : journey.status === 'active' ? 'green' : 'gray'}`}><i />{stale ? 'Exit missed' : journey.status === 'active' ? 'Live' : 'Exited'}</span></td><td>{new Date(lastVisit.lastSeenAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td><div className="lm-row-actions">{journey.status === 'active' ? <button title="Complete journey manually" type="button" onClick={(event) => { event.stopPropagation(); completeJourney(journey); }}><Check size={14} /></button> : null}<button title="Correct plate number" type="button" onClick={(event) => { event.stopPropagation(); correctPlate(journey); }}><Pencil size={14} /></button><button title="Delete vehicle record" type="button" onClick={(event) => { event.stopPropagation(); deleteJourney(journey); }}><Trash2 size={14} /></button></div></td></tr>; })}{!visible.length ? <tr><td colSpan={9} className="lm-empty">No confirmed vehicle journeys yet. Start a mapped LPR camera to begin tracking.</td></tr> : null}</tbody></table></div></section><aside className="lm-card lm-live-panel"><header><Radio size={19} /><div><h3>Live Status</h3><p>Currently tracked vehicles in the workshop.</p></div></header>{active.slice(0, 8).map((journey) => <button key={journey.id} onClick={() => openSummary(journey)} type="button"><i /><span><strong>{journey.plate}</strong><small>At {process.stages.find((item) => item.id === journey.currentStageId)?.name}</small></span><em>{shortDuration(journeyTotal(journey))}</em></button>)}{!active.length ? <div className="lm-empty">No active vehicles</div> : null}</aside></div><section className="lm-card lm-performance"><header><BarChart3 size={19} /><h3>Workshop Performance (Today)</h3></header><div><article><Clock3 /><span><small>Avg Journey Time</small><strong>{shortDuration(avg(journeys.map(journeyTotal)))}</strong></span></article><article><Timer /><span><small>Avg Waiting Time</small><strong>{shortDuration(avg(journeys.map(journeyWaiting)))}</strong></span></article><article><UserRound /><span><small>Worker Active Time</small><strong>{totalWorker ? Math.round(activeWorker / totalWorker * 100) : 0}%</strong></span></article><article><Pause /><span><small>Worker Idle Time</small><strong>{totalWorker ? Math.round((totalWorker - activeWorker) / totalWorker * 100) : 0}%</strong></span></article></div></section></div>;
+  return <div className="lm-stack">
+    <div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking</span><h2>Lifecycle Tracking</h2><p>Monitor confirmed vehicles, last-known station status, and evidence-based timings.</p></div></div>
+    <section className="lm-card lm-filters">
+      <label><span>Search vehicles</span><div><Search size={15} /><input placeholder="Search by vehicle number..." value={query} onChange={(event) => setQuery(event.target.value)} /></div></label>
+      <label><span>Date</span><div><CalendarDays size={15} /><input aria-label="Journey date" type="date" value={date} onChange={(event) => setDate(event.target.value)} /></div></label>
+      <label><span>Last known station</span><select value={station} onChange={(event) => setStation(event.target.value)}><option value="">All stations</option>{process.stages.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+      <label><span>Status</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="active">In progress</option><option value="completed">Completed</option></select></label>
+      <button className="lm-primary" onClick={refresh} type="button"><RefreshCw size={15} />Refresh</button>
+    </section>
+    <section className="lm-tracking-kpis">
+      <article><Car /><span><small>Vehicles on date</small><strong>{journeys.length}</strong><em>Confirmed OCR journeys</em></span></article>
+      <article><Clock3 /><span><small>In progress</small><strong>{active.length}</strong><em>All currently open journeys</em></span></article>
+      <article><Check /><span><small>Completed on date</small><strong>{completed.length}</strong><em>End scan or manual close</em></span></article>
+      <article><AlertTriangle /><span><small>Needs review</small><strong>{active.filter((item) => now - item.lastActivityAt > delayedAfterSeconds).length}</strong><em>No update for {process.staleAfterMinutes ?? 30} min</em></span></article>
+    </section>
+    <div className="lm-tracking-grid">
+      <section className="lm-card lm-entries"><header><List size={19} /><div><h3>Detected vehicle entries</h3><p>Select a row to inspect the captured station sequence and timing evidence.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Vehicle</th><th>First seen</th><th>Current state</th><th>Last captured</th><th>Total elapsed</th><th>Status</th><th>Presence</th><th>Last seen</th><th>Actions</th></tr></thead><tbody>{visible.map((journey) => {
+        const lastVisit = journey.visits[journey.visits.length - 1];
+        const lastStage = process.stages.find((item) => item.id === lastVisit?.stageId);
+        const stale = journey.status === 'active' && now - (journey.lastActivityAt ?? lastVisit.lastSeenAt) > delayedAfterSeconds;
+        const plateVisible = journey.status === 'active' && now - lastVisit.lastSeenAt <= consecutiveFrameToleranceSeconds;
+        return <tr key={journey.id} onClick={() => openSummary(journey)}><td><strong>{journey.plate}</strong></td><td>{new Date(journey.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td>{location(journey)}</td><td>{lastStage?.name ?? 'Unknown'}</td><td>{shortDuration(journeyTotal(journey, now))}</td><td><span className={`lm-badge ${stale ? 'stale' : journey.status}`}>{stale ? 'Needs review' : journey.status === 'active' ? 'In progress' : 'Completed'}</span></td><td><span className={`lm-live ${stale ? 'orange' : plateVisible ? 'green' : 'gray'}`}><i />{journey.status === 'completed' ? 'Exited' : plateVisible ? 'Visible' : 'Last known'}</span></td><td>{new Date(lastVisit.lastSeenAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td><div className="lm-row-actions">{journey.status === 'active' ? <button title="Complete journey manually" type="button" onClick={(event) => { event.stopPropagation(); completeJourney(journey); }}><Check size={14} /></button> : null}<button title="Correct plate number" type="button" onClick={(event) => { event.stopPropagation(); correctPlate(journey); }}><Pencil size={14} /></button><button title="Delete vehicle record" type="button" onClick={(event) => { event.stopPropagation(); deleteJourney(journey); }}><Trash2 size={14} /></button></div></td></tr>;
+      })}{!visible.length ? <tr><td colSpan={9} className="lm-empty">No journeys match these filters. Check the date, mapping, camera feed, and engine readiness.</td></tr> : null}</tbody></table></div></section>
+      <aside className="lm-card lm-live-panel"><header><Radio size={19} /><div><h3>Open journeys</h3><p>Current or last-known vehicle location.</p></div></header>{active.slice(0, 8).map((journey) => <button key={journey.id} onClick={() => openSummary(journey)} type="button"><i /><span><strong>{journey.plate}</strong><small>{location(journey)}</small></span><em>{shortDuration(journeyTotal(journey, now))}</em></button>)}{!active.length ? <div className="lm-empty">No active vehicles</div> : null}</aside>
+    </div>
+    <section className="lm-card lm-performance"><header><BarChart3 size={19} /><h3>Performance for selected date</h3></header><div><article><Clock3 /><span><small>Avg journey time</small><strong>{shortDuration(avg(journeys.map((journey) => journeyTotal(journey, now))))}</strong></span></article><article><Timer /><span><small>Avg pre-work wait</small><strong>{shortDuration(avg(journeys.map((journey) => journeyWaiting(journey, process, now))))}</strong></span></article><article><UserRound /><span><small>Worker active share</small><strong>{totalWorker ? Math.round(activeWorker / totalWorker * 100) : 0}%</strong></span></article><article><Pause /><span><small>Explicit worker idle</small><strong>{totalWorker ? Math.round((totalWorker - activeWorker) / totalWorker * 100) : 0}%</strong></span></article></div></section>
+  </div>;
 }
 
 function LifecycleSummary({ process, journey, back }: { process: LprProcess; journey?: LprJourney; back: () => void }) {
   const lpr = useLpr();
-  const now = useLifecycleClock();
+  const { now } = useLifecycleClock();
   if (!journey) return <div className="lm-card lm-empty lm-summary-empty"><Car size={34} /><h2>No journey selected</h2><p>Open Lifecycle Tracking and select a vehicle.</p><button className="lm-primary" onClick={back} type="button">Back to Tracking</button></div>;
-  const total = journeyTotal(journey, now); const processing = journeyProcessing(journey); const waiting = journeyWaiting(journey, now); const working = journeyWorker(journey, 'workingSeconds'); const idle = journeyWorker(journey, 'idleSeconds');
+  const total = journeyTotal(journey, now); const processing = journeyProcessing(journey); const waiting = journeyWaiting(journey, process, now); const transit = journeyTransit(journey); const idle = journeyWorker(journey, 'idleSeconds'); const unknown = journeyWorker(journey, 'unknownSeconds');
   const correctPlate = () => {
     const next = window.prompt('Correct vehicle number', journey.plate);
     if (next && normalizePlate(next)) lpr.updateJourneyPlate(journey.id, next);
@@ -797,7 +851,7 @@ function LifecycleSummary({ process, journey, back }: { process: LprProcess; jou
   const completeRecord = () => {
     if (window.confirm(`Complete ${journey.plate} manually? Use this only when the exit scan was missed.`)) lpr.completeJourney(journey.id);
   };
-  return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking <ArrowRight size={12} /> Vehicle Journey Summary</span><h2>Vehicle Journey Summary</h2><p>Journey reconstructed from actual station scans and worker events.</p></div><div><button className="lm-secondary" onClick={back} type="button"><ArrowLeft size={15} />Back to Tracking</button>{journey.status === 'active' ? <button className="lm-primary" onClick={completeRecord} type="button"><Check size={15} />Complete Journey</button> : null}<button className="lm-secondary" onClick={correctPlate} type="button"><Pencil size={15} />Correct Plate</button><button className="lm-danger" onClick={deleteRecord} type="button"><Trash2 size={15} />Delete Record</button><button className="lm-secondary" onClick={() => window.print()} type="button"><Download size={15} />Export PDF</button><button className="lm-primary" onClick={() => window.print()} type="button"><BarChart3 size={15} />Generate Report</button></div></div><section className="lm-card lm-journey-meta"><article>{journey.plateImage ? <img className="lm-journey-plate-image" src={journey.plateImage} alt={journey.plate} /> : <Car />}<span><small>Vehicle Number</small><strong>{journey.plate}</strong></span></article><article><CalendarDays /><span><small>Date</small><strong>{new Date(journey.startedAt * 1000).toLocaleDateString()}</strong></span></article><article><Check /><span><small>Overall Status</small><strong className={`lm-badge ${journey.status}`}>{journey.status === 'completed' ? 'Completed' : 'In Progress'}</strong></span></article><article><Clock3 /><span><small>Start Time</small><strong>{new Date(journey.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong></span></article><article><CircleDot /><span><small>End Time</small><strong>{journey.completedAt ? new Date(journey.completedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</strong></span></article></section><section className="lm-summary-kpis"><article><Clock3 /><span><small>Total Journey Time</small><strong>{shortDuration(total)}</strong></span></article><article><Settings2 /><span><small>Processing Time</small><strong>{shortDuration(processing)}</strong><em>{total ? Math.round(processing / total * 100) : 0}% of total time</em></span></article><article><Timer /><span><small>Waiting Between Stations</small><strong>{shortDuration(waiting)}</strong><em>{total ? Math.round(waiting / total * 100) : 0}% of total time</em></span></article><article><UserRound /><span><small>Worker Active Time</small><strong>{shortDuration(working)}</strong></span></article><article><Pause /><span><small>Worker Idle Time</small><strong>{shortDuration(idle)}</strong></span></article></section><section className="lm-card lm-sequence"><header><List size={18} /><div><h3>Actual captured station sequence</h3><p>Only visited stations are shown.</p></div></header><div>{journey.visits.map((visit, index) => { const stage = process.stages.find((item) => item.id === visit.stageId); return <article key={`${visit.stageId}-${visit.enteredAt}`}><i>{index + 1}</i><strong>{stage?.name ?? visit.stageId}</strong><small>{new Date(visit.enteredAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} → {visit.leftAt ? new Date(visit.leftAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Now'}</small><span>{shortDuration(stageDuration(visit))}</span><em>{stage?.type === 'entry' ? 'Entry' : stage?.type === 'exit' ? 'Exit' : 'Visited'}</em></article>; })}</div></section><div className="lm-summary-grid"><section className="lm-card lm-station-summary"><header><List size={18} /><div><h3>Station Summary</h3><p>Timing breakdown for each visited station.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Station</th><th>Entry</th><th>Exit</th><th>Total Time</th><th>Waiting</th><th>Worker Active</th><th>Worker Idle</th></tr></thead><tbody>{journey.visits.map((visit, index) => <tr key={`${visit.stageId}-row`}><td>{process.stages.find((item) => item.id === visit.stageId)?.name}</td><td>{new Date(visit.enteredAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td>{visit.leftAt ? new Date(visit.leftAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td><td><strong>{shortDuration(stageDuration(visit))}</strong></td><td>{index ? shortDuration(Math.max(0, visit.enteredAt - (journey.visits[index - 1].leftAt ?? journey.visits[index - 1].lastSeenAt))) : '—'}</td><td>{shortDuration(visit.workingSeconds)}</td><td>{shortDuration(visit.idleSeconds)}</td></tr>)}</tbody></table></div></section><section className="lm-card lm-captured-log"><header><FileText size={18} /><div><h3>Captured Event Log</h3><p>Chronological list of key system events.</p></div></header>{journey.events.slice().reverse().map((item) => <div key={item.id}><i /><time>{new Date(item.timestamp * 1000).toLocaleTimeString()}</time><strong>{item.type.replaceAll('_', ' ')}</strong><span>{item.detail}</span></div>)}</section></div></div>;
+  return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking <ArrowRight size={12} /> Vehicle Journey Summary</span><h2>Vehicle Journey Summary</h2><p>Journey reconstructed from confirmed station scans and explicit worker signals.</p></div><div><button className="lm-secondary" onClick={back} type="button"><ArrowLeft size={15} />Back to Tracking</button>{journey.status === 'active' ? <button className="lm-primary" onClick={completeRecord} type="button"><Check size={15} />Complete Journey</button> : null}<button className="lm-secondary" onClick={correctPlate} type="button"><Pencil size={15} />Correct Plate</button><button className="lm-danger" onClick={deleteRecord} type="button"><Trash2 size={15} />Delete Record</button><button className="lm-secondary" onClick={() => window.print()} type="button"><Download size={15} />Export PDF</button></div></div><section className="lm-card lm-journey-meta"><article>{journey.plateImage ? <img className="lm-journey-plate-image" src={journey.plateImage} alt={journey.plate} /> : <Car />}<span><small>Vehicle Number</small><strong>{journey.plate}</strong></span></article><article><CalendarDays /><span><small>Date</small><strong>{new Date(journey.startedAt * 1000).toLocaleDateString()}</strong></span></article><article><Check /><span><small>Overall Status</small><strong className={`lm-badge ${journey.status}`}>{journey.status === 'completed' ? 'Completed' : 'In Progress'}</strong></span></article><article><Clock3 /><span><small>Start Time</small><strong>{new Date(journey.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong></span></article><article><CircleDot /><span><small>End Time</small><strong>{journey.completedAt ? new Date(journey.completedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</strong></span></article></section><section className="lm-summary-kpis"><article><Clock3 /><span><small>Total journey time</small><strong>{shortDuration(total)}</strong></span></article><article><Settings2 /><span><small>Confirmed work time</small><strong>{shortDuration(processing)}</strong><em>WORKER_WORKING only</em></span></article><article><Timer /><span><small>Pre-work wait</small><strong>{shortDuration(waiting)}</strong><em>Arrival until first work signal</em></span></article><article><Route /><span><small>Measured transit</small><strong>{shortDuration(transit)}</strong><em>Between confirmed station visits</em></span></article><article><Pause /><span><small>Explicit worker idle</small><strong>{shortDuration(idle)}</strong></span></article><article><AlertTriangle /><span><small>Unclassified signal time</small><strong>{shortDuration(unknown)}</strong></span></article></section><section className="lm-card lm-sequence"><header><List size={18} /><div><h3>Actual captured station sequence</h3><p>A lost OCR signal does not close a visit; the next confirmed station or completion event does.</p></div></header><div>{journey.visits.map((visit, index) => { const stage = process.stages.find((item) => item.id === visit.stageId); return <article key={`${visit.stageId}-${visit.enteredAt}`}><i>{index + 1}</i><strong>{stage?.name ?? visit.stageId}</strong><small>{new Date(visit.enteredAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} → {visit.leftAt ? new Date(visit.leftAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Open'}</small><span>{shortDuration(stageDuration(visit, now))}</span><em>{visit.presenceLostAt && !visit.leftAt ? 'Last known here' : stage?.type === 'entry' ? 'Entry' : stage?.type === 'exit' ? 'Exit' : 'Visited'}</em></article>; })}</div></section><div className="lm-summary-grid"><section className="lm-card lm-station-summary"><header><List size={18} /><div><h3>Station Summary</h3><p>Worker values are counted only when their matching rules are explicitly active.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Station</th><th>Entry</th><th>Confirmed exit</th><th>Station time</th><th>Pre-work wait</th><th>Worker active</th><th>Worker idle</th><th>No signal</th></tr></thead><tbody>{journey.visits.map((visit) => { const stage = process.stages.find((item) => item.id === visit.stageId); return <tr key={`${visit.stageId}-row`}><td>{stage?.name}</td><td>{new Date(visit.enteredAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td>{visit.leftAt ? new Date(visit.leftAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td><td><strong>{shortDuration(stageDuration(visit, now))}</strong></td><td>{stage?.trackWorker ? shortDuration(visitWaiting(visit, stage, now)) : 'Not tracked'}</td><td>{shortDuration(visit.workingSeconds)}</td><td>{shortDuration(visit.idleSeconds)}</td><td>{shortDuration(visit.unknownSeconds ?? 0)}</td></tr>; })}</tbody></table></div></section><section className="lm-card lm-captured-log"><header><FileText size={18} /><div><h3>Captured Event Log</h3><p>Chronological evidence used to reconstruct the journey.</p></div></header>{journey.events.slice().reverse().map((item) => <div key={item.id}><i /><time>{new Date(item.timestamp * 1000).toLocaleTimeString()}</time><strong>{item.type.replaceAll('_', ' ')}</strong><span>{item.detail}</span></div>)}</section></div></div>;
 }
 
 function LifecycleAutomations({ process }: { process: LprProcess }) {
@@ -875,6 +929,8 @@ export function LprTrackingPage({ initialSection = 'tracking' }: { initialSectio
   if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
   const entryStage = process.stages.find((stage) => stage.type === 'entry');
   const entryCamera = vision.cameras.find((camera) => camera.id === entryStage?.cameraId);
+  const entryZone = entryStage?.zoneId ? entryCamera?.configuration.zones.find((zone) => zone.id === entryStage.zoneId) : undefined;
+  const entryZoneReady = !entryStage?.zoneId || Boolean(entryZone && entryCamera?.configuration.analysisRoiIds.includes(entryZone.id) && entryZone.width > 0 && entryZone.height > 0);
   const lprModel = vision.models.find((model) => model.id === 'indian_lpr');
   const lifecycleBlocker = vision.workerStatus !== 'online'
     ? 'The AI worker is offline.'
@@ -886,6 +942,8 @@ export function LprTrackingPage({ initialSection = 'tracking' }: { initialSectio
           ? 'The start-station camera no longer exists.'
           : entryCamera.sourceStatus !== 'ready'
             ? `${entryCamera.name} has no connected feed.`
+            : !entryZoneReady
+              ? `The selected start-station zone is not drawn and active on ${entryCamera.name}.`
             : !entryCamera.configuration.selectedModelIds.includes('indian_lpr')
               ? `${entryCamera.name} is not configured to use Indian LPR.`
               : !vision.running[entryCamera.id]
