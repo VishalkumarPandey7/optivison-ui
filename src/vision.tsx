@@ -12,6 +12,15 @@ import {
 import { requestJson, visionRuntimeConfig } from './services/workerApi';
 import { backupStoredValue, readStoredJson, readStoredString, writeStoredJson, writeStoredString } from './state/persistence';
 import {
+  advanceSessionMetrics,
+  defaultOperationalMetricConfiguration,
+  migrateSessionMetrics,
+  normalizeOperationalMetricConfiguration,
+  resetSessionMetrics,
+  type OperationalMetricConfiguration,
+  type SessionMetrics
+} from './state/operationalMetrics';
+import {
   defaultCameraCardMetrics,
   migratePlantsAndCameras,
   plantIdForName,
@@ -20,6 +29,7 @@ import {
 } from './state/migrations';
 
 export { workerUrl } from './services/workerApi';
+export type { SessionMetrics } from './state/operationalMetrics';
 
 export type SourceType = 'browser' | 'uploaded' | 'usb' | 'http' | 'rtsp' | 'onvif' | 'nvr';
 export type SourceStatus = 'empty' | 'starting' | 'ready' | 'error';
@@ -126,6 +136,7 @@ export interface BusinessRuleDefinition {
   denominator?: BusinessMetricKey;
   operation: 'VALUE' | 'DIVIDE_PERCENT';
   unit: 'percent' | 'duration' | 'count';
+  scope?: 'session' | 'shift' | 'day';
 }
 
 export interface DisplayConfiguration {
@@ -223,6 +234,7 @@ export interface CameraConfiguration {
   signals: SignalDefinition[];
   rules: RuleDefinition[];
   businessRules: BusinessRuleDefinition[];
+  operationalMetrics: OperationalMetricConfiguration;
   monitoringMetrics: CameraCardMetric[];
   display: DisplayConfiguration;
   analysisRoiIds: string[];
@@ -252,15 +264,6 @@ export interface RuntimeEvent {
   type: 'detection' | 'signal' | 'rule' | 'count' | 'error';
   title: string;
   detail: string;
-}
-
-export interface SessionMetrics {
-  activeSeconds: number;
-  idleSeconds: number;
-  absentSeconds: number;
-  uptimeSeconds: number;
-  downtimeSeconds: number;
-  lastTimestamp: number | null;
 }
 
 type Update<T> = T | ((current: T) => T);
@@ -351,6 +354,7 @@ const defaultConfiguration = (useCase: CameraConfiguration['useCase'] = 'worker'
   signals: defaultSignals(),
   rules: defaultRules(),
   businessRules: defaultBusinessRules(),
+  operationalMetrics: defaultOperationalMetricConfiguration(),
   monitoringMetrics: defaultCameraCardMetrics(),
   display: defaultDisplay(),
   analysisRoiIds: [],
@@ -384,11 +388,11 @@ const plantsStorageKey = 'optivision-plants-v1';
 const selectedPlantStorageKey = 'optivision-selected-plant-v1';
 const activeCameraStorageKey = 'optivision-active-camera-v1';
 const eventsStorageKey = 'optivision-runtime-events-v1';
-const metricsStorageKey = 'optivision-session-metrics-v1';
+const legacyMetricsStorageKey = 'optivision-session-metrics-v1';
+const metricsStorageKey = 'optivision-operational-metrics-v2';
+const metricsStorageBackupKey = 'optivision-session-metrics-v1:backup:pre-operational-metrics-v2';
 const mediaDatabaseName = 'optivision-media-v1';
 const mediaStoreName = 'camera-sources';
-const emptyMetrics: SessionMetrics = { activeSeconds: 0, idleSeconds: 0, absentSeconds: 0, uptimeSeconds: 0, downtimeSeconds: 0, lastTimestamp: null };
-
 interface StoredCameraMedia {
   cameraId: string;
   name: string;
@@ -468,6 +472,7 @@ function loadVisionState(): { cameras: CameraRecord[]; plants: PlantRecord[] } {
           ...camera.configuration,
           zones,
           businessRules: camera.configuration?.businessRules ?? defaultBusinessRules(),
+          operationalMetrics: normalizeOperationalMetricConfiguration(camera.configuration?.operationalMetrics),
           monitoringMetrics: camera.configuration?.monitoringMetrics ?? defaultCameraCardMetrics(),
           display: { ...defaultDisplay(), ...(camera.configuration?.display ?? {}) }
         }
@@ -580,8 +585,14 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   const [running, setRunning] = useState<Record<string, boolean>>({});
   const [events, setEvents] = useState<RuntimeEvent[]>(() => readStoredJson<RuntimeEvent[]>(eventsStorageKey, []));
   const [metrics, setMetrics] = useState<Record<string, SessionMetrics>>(() => {
-    const saved = readStoredJson<Record<string, SessionMetrics>>(metricsStorageKey, {});
-    return Object.fromEntries(Object.entries(saved).map(([cameraId, value]) => [cameraId, { ...emptyMetrics, ...value, lastTimestamp: null }]));
+    const saved = readStoredJson<Record<string, unknown>>(metricsStorageKey, {});
+    const legacy = readStoredJson<Record<string, unknown>>(legacyMetricsStorageKey, {});
+    if (Object.keys(legacy).length) backupStoredValue(legacyMetricsStorageKey, metricsStorageBackupKey);
+    const timestamp = Date.now() / 1000;
+    return Object.fromEntries(cameras.map((camera) => [
+      camera.id,
+      migrateSessionMetrics(saved[camera.id], legacy[camera.id], camera.configuration.operationalMetrics.shift, timestamp)
+    ]));
   });
   const cameraRef = useRef(cameras);
   // Runtime videos stay mounted inside VisionProvider and are the only source
@@ -620,7 +631,7 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   useEffect(() => { writeStoredString(selectedPlantStorageKey, selectedPlantId); }, [selectedPlantId]);
   useEffect(() => { writeStoredJson(eventsStorageKey, events.slice(0, 500)); }, [events]);
   useEffect(() => {
-    const persistable = Object.fromEntries(Object.entries(metrics).map(([cameraId, value]) => [cameraId, { ...value, lastTimestamp: null }]));
+    const persistable = Object.fromEntries(Object.entries(metrics).map(([cameraId, value]) => [cameraId, { ...value, lastTimestamp: null, workerState: 'unknown', machineState: 'unknown' }]));
     writeStoredJson(metricsStorageKey, persistable);
   }, [metrics]);
 
@@ -866,6 +877,10 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     if (!camera) return;
     if (running[cameraId]) {
       setRunning((current) => ({ ...current, [cameraId]: false }));
+      setMetrics((current) => {
+        const metrics = current[cameraId];
+        return metrics ? { ...current, [cameraId]: { ...metrics, workerState: 'unknown', machineState: 'unknown', lastTimestamp: null } } : current;
+      });
       return;
     }
     if (workerStatus !== 'online') throw new Error('Signal worker is offline.');
@@ -882,7 +897,12 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     await requestJson('/reset', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cameraId }) });
     setFrames((current) => { const next = { ...current }; delete next[cameraId]; return next; });
     setEvents((current) => current.filter((event) => event.cameraId !== cameraId));
-    setMetrics((current) => ({ ...current, [cameraId]: { ...emptyMetrics } }));
+    const camera = cameraRef.current.find((item) => item.id === cameraId);
+    setMetrics((current) => {
+      const previous = current[cameraId];
+      if (!camera || !previous) return current;
+      return { ...current, [cameraId]: resetSessionMetrics(previous, camera.configuration.operationalMetrics.shift) };
+    });
     lastOutputs.current[cameraId] = [];
   }, []);
 
@@ -1011,20 +1031,12 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             if (changedSignals.length) setEvents((current) => [...changedSignals.map((signal) => ({ id: `${camera.id}-${signal.signalId}-${response.timestamp}`, cameraId: camera.id, timestamp: response.timestamp, type: signal.kind === 'line_crossing_count' ? 'count' as const : 'signal' as const, title: signal.name, detail: signal.active ? 'Became active' : 'Became inactive' })), ...current].slice(0, 500));
             lastOutputs.current[camera.id] = response.outputs;
             setMetrics((current) => {
-              const previousMetrics = current[camera.id] ?? emptyMetrics;
-              const delta = previousMetrics.lastTimestamp ? Math.min(2, Math.max(0, response.timestamp - previousMetrics.lastTimestamp)) : 0;
-              const workerActive = response.rules.some((rule) => rule.output === 'WORKER_WORKING' && rule.active);
-              const workerIdle = response.rules.some((rule) => rule.output === 'WORKER_IDLE' && rule.active);
-              const absent = response.signals.some((signal) => signal.signalId === 'operator-absent' && signal.active);
-              const machineIdle = response.signals.some((signal) => signal.signalId === 'machine-idle' && signal.active);
-              return { ...current, [camera.id]: {
-                activeSeconds: previousMetrics.activeSeconds + (workerActive ? delta : 0),
-                idleSeconds: previousMetrics.idleSeconds + (workerIdle ? delta : 0),
-                absentSeconds: previousMetrics.absentSeconds + (absent ? delta : 0),
-                uptimeSeconds: previousMetrics.uptimeSeconds + (!machineIdle ? delta : 0),
-                downtimeSeconds: previousMetrics.downtimeSeconds + (machineIdle ? delta : 0),
-                lastTimestamp: response.timestamp
-              } };
+              const previousMetrics = current[camera.id]
+                ?? migrateSessionMetrics(undefined, undefined, config.operationalMetrics.shift, response.timestamp);
+              return {
+                ...current,
+                [camera.id]: advanceSessionMetrics(previousMetrics, response, config.operationalMetrics, response.timestamp)
+              };
             });
             delete lastErrorEvents.current[camera.id];
             if (camera.error) updateCamera(camera.id, { error: '' });

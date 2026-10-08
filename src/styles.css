@@ -438,7 +438,7 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .camera-admin-stats small { color: var(--muted); font-size: 8px; }
 .camera-admin-stats strong { margin-top: 4px; font-size: 10px; white-space: nowrap; }
 .camera-admin-card footer { display: flex; gap: 5px; padding: 12px; }
-.table-panel { overflow: hidden; }
+.table-panel { overflow-x: auto; overflow-y: hidden; }
 .table-toolbar { display: flex; gap: 8px; padding: 14px; border-bottom: 1px solid var(--line); }
 .table-toolbar .search { width: 260px; min-width: 0; }
 .table-toolbar select { width: 160px; }
@@ -583,7 +583,23 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .business-value strong { color: var(--orange-dark); font-size: 14px; }
 .display-color-row { display: flex; align-items: center; justify-content: space-between; min-height: 34px; border-bottom: 1px solid var(--line); font-size: 10px; }
 .display-color-row input { width: 42px; height: 26px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
-.business-definition-head, .business-definition-row { grid-template-columns: minmax(150px, 1.1fr) minmax(230px, 2fr) minmax(100px, .7fr) 90px !important; }
+.business-definition-head, .business-definition-row { grid-template-columns: minmax(145px, 1.1fr) minmax(210px, 1.7fr) minmax(100px, .7fr) minmax(100px, .7fr) 90px !important; }
+.business-definition-row > select { width: 100%; min-height: 34px; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 6px 9px; }
+.operational-metric-setup { padding: 22px; }
+.operational-metric-setup > .section-heading { padding: 0; }
+.operational-binding-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.operational-binding-grid > label { display: grid; grid-template-columns: minmax(125px, .75fr) minmax(180px, 1.25fr); align-items: center; gap: 12px; min-height: 64px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.operational-binding-grid strong, .operational-binding-grid small { display: block; }
+.operational-binding-grid strong { font-size: 12px; }
+.operational-binding-grid small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.operational-binding-grid select { width: 100%; min-width: 0; }
+.shift-configuration { display: grid; grid-template-columns: 170px 170px minmax(180px, 1fr) minmax(180px, 1fr); align-items: end; gap: 12px; margin-top: 14px; padding: 14px; border-radius: 10px; background: var(--orange-soft); }
+.shift-configuration .field { margin: 0; }
+.shift-configuration > div > small, .shift-configuration > div > strong { display: block; }
+.shift-configuration > div > small { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+.shift-configuration > div > strong { margin-top: 7px; font-size: 11px; }
+.unknown-text { color: #7c746d !important; }
+.camera-status.unknown { background: #756f69; }
 .available-rule-library { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .event-history { overflow: hidden; }
 .event-history > .section-heading { padding-bottom: 18px; }
@@ -1131,7 +1147,10 @@ button:disabled { opacity: .42; cursor: not-allowed; }
   .page-title { align-items: flex-start; flex-direction: column; }
   .hero-card { padding: 25px; }
   .hero-card h2 { font-size: 25px; }
-  .hero-metrics, .source-grid, .form-grid, .review-grid, .camera-admin-grid, .monitor-grid.columns-2, .monitor-grid.columns-3, .signal-library, .integration-grid { grid-template-columns: 1fr; }
+  .hero-metrics, .source-grid, .form-grid, .review-grid, .camera-admin-grid, .monitor-grid.columns-2, .monitor-grid.columns-3, .signal-library, .integration-grid, .operational-binding-grid, .shift-configuration { grid-template-columns: 1fr; }
+  .operational-metric-setup > .section-heading { flex-direction: column; gap: 12px; }
+  .operational-metric-setup > .section-heading .pill { max-width: 100%; white-space: normal; line-height: 1.3; }
+  .operational-binding-grid > label { grid-template-columns: 1fr; gap: 8px; }
   .field.wide { grid-column: auto; }
   .feed { min-height: 320px; }
   .automation-condition, .action-grid { grid-template-columns: 1fr; }

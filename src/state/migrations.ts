@@ -1,3 +1,5 @@
+import { normalizeOperationalMetricConfiguration } from './operationalMetrics.js';
+
 export interface PlantRecord {
   id: string;
   name: string;
@@ -111,7 +113,8 @@ export function migratePlantsAndCameras(rawCameras: unknown, rawPlants: unknown)
       location: plant.name,
       configuration: {
         ...configuration,
-        monitoringMetrics: existingMetrics.length ? existingMetrics : defaultCameraCardMetrics()
+        monitoringMetrics: existingMetrics.length ? existingMetrics : defaultCameraCardMetrics(),
+        operationalMetrics: normalizeOperationalMetricConfiguration(configuration.operationalMetrics)
       }
     };
   });
