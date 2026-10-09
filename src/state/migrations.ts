@@ -126,9 +126,13 @@ export function migrateLprProcesses(rawProcesses: unknown): UnknownRecord[] {
   if (!Array.isArray(rawProcesses)) return [];
   return rawProcesses.filter(isRecord).map<UnknownRecord>((process) => {
     const stages = Array.isArray(process.stages) ? process.stages.filter(isRecord) : [];
+    const retiredStages = Array.isArray(process.retiredStages) ? process.retiredStages.filter(isRecord) : [];
     return {
       ...process,
-      stages: stages.map((stage, index) => ({ ...stage, order: index }))
+      stages: stages.map((stage, index) => ({ ...stage, order: index })),
+      retiredStages: retiredStages
+        .filter((stage) => nonEmptyString(stage.id) && nonEmptyString(stage.name))
+        .map((stage) => ({ id: stage.id, name: stage.name }))
     };
   });
 }
@@ -139,7 +143,12 @@ export function migrateLifecycleAutomations(rawAutomations: unknown, rawProcesse
 
   return rawAutomations.filter(isRecord).map((automation, index) => {
     const process = processes.find((item) => item.id === automation.processId) ?? processes[0];
-    const stages = process && Array.isArray(process.stages) ? process.stages.filter(isRecord) : [];
+    const stages = process
+      ? [
+          ...(Array.isArray(process.stages) ? process.stages.filter(isRecord) : []),
+          ...(Array.isArray(process.retiredStages) ? process.retiredStages.filter(isRecord) : [])
+        ]
+      : [];
     const stationReferences = [
       ...(Array.isArray(automation.stationIds) ? automation.stationIds : []),
       ...(Array.isArray(automation.stations) ? automation.stations : [])

@@ -47,6 +47,14 @@ assert.deepEqual(
   'station IDs must remain unchanged'
 );
 assert.deepEqual(migratedProcesses[0].stages.map((stage) => stage.order), [0, 1, 2], 'station order must follow the existing sequence');
+assert.deepEqual(migratedProcesses[0].retiredStages, [], 'legacy processes must safely gain an empty retired-stage history');
+
+const processWithDeletedStage = migrateLprProcesses([{
+  ...legacyProcesses[0],
+  stages: legacyProcesses[0].stages.filter((stage) => stage.id !== 'station-original-service'),
+  retiredStages: [{ id: 'station-original-service', name: 'Service Bay 1', ignoredLegacyValue: true }]
+}]);
+assert.deepEqual(processWithDeletedStage[0].retiredStages, [{ id: 'station-original-service', name: 'Service Bay 1' }], 'deleted station identity must remain readable without reactivating the stage');
 
 const legacyAutomations = [{
   id: 'customer-stage', name: 'Customer Stage Update', audience: 'Customer', trigger: 'Vehicle reached station',
@@ -60,6 +68,11 @@ assert.deepEqual(
   migrateLifecycleAutomations(migratedAutomations, migratedProcesses),
   migratedAutomations,
   'automation migration must be idempotent'
+);
+assert.deepEqual(
+  migrateLifecycleAutomations(legacyAutomations, processWithDeletedStage)[0].stationIds,
+  ['station-original-service'],
+  'automation references must resolve against retired stations'
 );
 
 const legacyJourney = {

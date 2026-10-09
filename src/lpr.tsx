@@ -17,6 +17,11 @@ export interface LprStage {
   trackWorker: boolean;
 }
 
+export interface RetiredLprStage {
+  id: string;
+  name: string;
+}
+
 export interface LprProcess {
   id: string;
   name: string;
@@ -27,6 +32,7 @@ export interface LprProcess {
   minimumTransitionSeconds: number;
   staleAfterMinutes: number;
   stages: LprStage[];
+  retiredStages: RetiredLprStage[];
 }
 
 export interface LprVisit {
@@ -75,6 +81,8 @@ interface LprContextValue {
   addProcess: () => void;
   updateProcess: (id: string, update: Partial<LprProcess>) => void;
   reorderStages: (processId: string, orderedStageIds: string[]) => void;
+  removeStage: (processId: string, stageId: string) => void;
+  restoreStage: (processId: string, stage: LprStage, index: number) => void;
   removeProcess: (id: string) => void;
   recordScan: (processId: string, stageId: string, plate: string, workerState?: WorkerState, timestamp?: number) => void;
   updateJourneyPlate: (id: string, plate: string) => void;
@@ -205,6 +213,7 @@ function defaultProcess(cameraId: string, plantId: string, zoneIds: string[]): L
   return {
     id: 'vehicle-service-flow', name: 'Vehicle Lifecycle', plantId, modelId: 'indian_lpr', active: true,
     flowMode: 'flexible', minimumTransitionSeconds: 2, staleAfterMinutes: 30,
+    retiredStages: [],
     stages: stations.map((name, index) => ({
       id: `station-${index + 1}`,
       order: index,
@@ -215,6 +224,12 @@ function defaultProcess(cameraId: string, plantId: string, zoneIds: string[]): L
       trackWorker: index > 0 && index < stations.length - 1
     }))
   };
+}
+
+function findProcessStage(process: LprProcess | undefined, stageId: string | undefined) {
+  if (!process || !stageId) return undefined;
+  return process.stages.find((stage) => stage.id === stageId)
+    ?? process.retiredStages.find((stage) => stage.id === stageId);
 }
 
 function event(type: LprEvent['type'], stageId: string, timestamp: number, detail: string): LprEvent {
@@ -338,7 +353,7 @@ function closeExpiredCandidateVisits(current: LprJourney[], expiredCandidates: L
     if (!visit) return journey;
     if (visit.presenceLostAt) return journey;
     visit.presenceLostAt = candidate.lastSeen;
-    const stage = processes.find((process) => process.id === candidate.processId)?.stages.find((item) => item.id === candidate.stageId);
+    const stage = findProcessStage(processes.find((process) => process.id === candidate.processId), candidate.stageId);
     copy.events.push(event('plate_signal_lost', candidate.stageId, candidate.lastSeen, `${copy.plate} is no longer visible at ${stage?.name ?? 'station'}; station exit is not confirmed`));
     return copy;
   }), current);
@@ -508,6 +523,31 @@ export function LprProvider({ children }: { children: ReactNode }) {
       process.stages.forEach((stage) => { if (!orderedStageIds.includes(stage.id)) reordered.push(stage); });
       return { ...process, stages: reordered.map((stage, index) => ({ ...stage, order: index })) };
     })),
+    removeStage: (processId, stageId) => setProcesses((current) => current.map((process) => {
+      if (process.id !== processId || process.stages.length <= 2) return process;
+      const removed = process.stages.find((stage) => stage.id === stageId);
+      if (!removed) return process;
+      return {
+        ...process,
+        stages: process.stages
+          .filter((stage) => stage.id !== stageId)
+          .map((stage, index) => ({ ...stage, order: index })),
+        retiredStages: [
+          ...process.retiredStages.filter((stage) => stage.id !== stageId),
+          { id: removed.id, name: removed.name.trim() || 'Deleted station' }
+        ]
+      };
+    })),
+    restoreStage: (processId, stageToRestore, restoreIndex) => setProcesses((current) => current.map((process) => {
+      if (process.id !== processId || process.stages.some((stage) => stage.id === stageToRestore.id)) return process;
+      const stages = [...process.stages];
+      stages.splice(Math.max(0, Math.min(restoreIndex, stages.length)), 0, stageToRestore);
+      return {
+        ...process,
+        stages: stages.map((stage, index) => ({ ...stage, order: index })),
+        retiredStages: process.retiredStages.filter((stage) => stage.id !== stageToRestore.id)
+      };
+    })),
     removeProcess: (id) => setProcesses((current) => current.filter((process) => process.id !== id)),
     recordScan: (processId, stageId, plate, workerState = 'idle', timestamp = Date.now() / 1000) => {
       const process = processes.find((item) => item.id === processId); const stage = process?.stages.find((item) => item.id === stageId);
@@ -676,6 +716,7 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
   const [newStationName, setNewStationName] = useState('');
   const [newStationCameraId, setNewStationCameraId] = useState('');
   const [newStationType, setNewStationType] = useState<StageType>('station');
+  const [lastDeletedStage, setLastDeletedStage] = useState<{ stage: LprStage; index: number } | null>(null);
   const process = lpr.processes.find((item) => item.id === lpr.selectedProcessId) ?? lpr.processes[0];
   if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
 
@@ -734,15 +775,38 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
     setNewStationType('station');
   };
   const deleteStation = (stage: LprStage) => {
-    if (process.stages.length <= 2 || !window.confirm(`Delete ${stage.name}? Existing journey history will keep its station ID reference.`)) return;
-    const remaining = process.stages.filter((item) => item.id !== stage.id);
-    if (stage.type === 'entry') remaining[0] = { ...remaining[0], type: 'entry' };
-    if (stage.type === 'exit') remaining[remaining.length - 1] = { ...remaining[remaining.length - 1], type: 'exit' };
-    updateStages(remaining);
+    if (process.stages.length <= 2) {
+      setNoticeTone('info');
+      setNotice('A lifecycle needs at least two stages. Rename or edit these stages instead of deleting them.');
+      return;
+    }
+    const index = process.stages.findIndex((item) => item.id === stage.id);
+    lpr.removeStage(process.id, stage.id);
+    setLastDeletedStage({ stage, index });
+    setNoticeTone('success');
+    setNotice(`${stage.name || 'Station'} was removed. ${stage.type === 'entry' ? 'Choose a new Start station.' : stage.type === 'exit' ? 'Choose a new End station.' : 'Its historical ID is preserved.'}`);
+  };
+  const undoDeleteStation = () => {
+    if (!lastDeletedStage) return;
+    lpr.restoreStage(process.id, lastDeletedStage.stage, lastDeletedStage.index);
+    setNoticeTone('success');
+    setNotice(`${lastDeletedStage.stage.name || 'Station'} was restored.`);
+    setLastDeletedStage(null);
   };
   const saveAndStart = async () => {
     const entryStage = process.stages.find((stage) => stage.type === 'entry');
-    if (!entryStage?.cameraId) {
+    const exitStage = process.stages.find((stage) => stage.type === 'exit');
+    if (!entryStage) {
+      setNoticeTone('info');
+      setNotice('Choose one Start station before saving the lifecycle.');
+      return;
+    }
+    if (!exitStage) {
+      setNoticeTone('info');
+      setNotice('Choose one End station before saving the lifecycle.');
+      return;
+    }
+    if (!entryStage.cameraId) {
       setNoticeTone('info');
       setNotice('Select a camera for the Start station. Plate detections cannot create a lifecycle until that camera is mapped.');
       return;
@@ -761,18 +825,19 @@ export function LifecycleStationSetup({ plantId }: { plantId: string }) {
 
   return <div className="lm-stack setup-lifecycle-step">
     <div className="lm-setup-toolbar"><p>Add, rename, reorder, map or remove stations manually. Existing station IDs remain stable.</p><button className="lm-primary" type="button" onClick={() => void saveAndStart()}><Play size={15} />Save mapping</button></div>
-    {notice ? <div className={`inline-status ${noticeTone}`}>{noticeTone === 'success' ? <Check size={15} /> : <AlertTriangle size={15} />}<span><strong>{noticeTone === 'success' ? 'Lifecycle setup saved' : 'Lifecycle setup needs attention'}</strong><small>{notice}</small></span></div> : null}
+    {notice && !lastDeletedStage ? <div className={`inline-status ${noticeTone}`} role="status">{noticeTone === 'success' ? <Check size={15} /> : <AlertTriangle size={15} />}<span><strong>{noticeTone === 'success' ? 'Lifecycle setup saved' : 'Lifecycle setup needs attention'}</strong><small>{notice}</small></span></div> : null}
+    {lastDeletedStage ? <div className="station-delete-toast" role="status" aria-live="polite"><Check size={18} /><span><strong>Station removed</strong><small>{notice}</small></span><button onClick={undoDeleteStation} type="button">Undo</button><button aria-label="Dismiss station removed message" onClick={() => setLastDeletedStage(null)} type="button"><X size={16} /></button></div> : null}
     {!lprModel?.installed ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Indian LPR is unavailable</strong><small>The worker does not have the external Indian_LPR checkout and required weights. A visible plate box without recognized OCR text cannot create a vehicle lifecycle.</small></span></div> : null}
     <section className="lm-card lm-add-station">
       <header><div><h3>Add station</h3><p>Create a station, choose its camera feed, and decide whether it starts or ends the lifecycle.</p></div><span>{availableCameras.length} cameras available</span></header>
       <div><label><span>Station name *</span><input placeholder="Example: Paint Booth" value={newStationName} onChange={(event) => setNewStationName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') addStation(); }} /></label><label><span>Camera feed</span><select value={newStationCameraId} onChange={(event) => setNewStationCameraId(event.target.value)}><option value="">Assign camera later</option>{availableCameras.map((camera) => { const assignedStage = process.stages.find((stage) => stage.cameraId === camera.id); const plant = vision.plants.find((candidate) => candidate.id === camera.plantId); const cameraName = camera.name.trim() || camera.id; return <option disabled={Boolean(assignedStage)} key={camera.id} value={camera.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></label><label><span>Station role</span><select value={newStationType} onChange={(event) => setNewStationType(event.target.value as StageType)}><option value="station">Normal station</option><option value="entry">Start station</option><option value="exit">End station</option></select></label><button className="lm-primary" onClick={addStation} type="button"><Plus size={15} />Add station</button></div>
       <small>Only one Start and one End station are active. Choosing either role here changes the previous boundary station back to a normal station.</small>
     </section>
-    <section className="lm-card lm-mapping"><header><Route size={20} /><div><h3>Ordered stations</h3><p>Choose one start and one end station. Each camera can be used once; its plant is shown so entry and exit cameras can be mapped across sites.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Order</th><th>Station name</th><th>Camera</th><th>Zone</th><th>Worker activity</th><th>Start</th><th>End</th><th>Actions</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); return <tr key={stage.id}><td><div className="lm-order-actions"><button disabled={index === 0} aria-label={`Move ${stage.name} earlier`} onClick={() => moveStage(stage.id, -1)} type="button"><ArrowLeft size={13} /></button><strong>{index + 1}</strong><button disabled={index === process.stages.length - 1} aria-label={`Move ${stage.name} later`} onClick={() => moveStage(stage.id, 1)} type="button"><ArrowRight size={13} /></button></div></td><td><input aria-label={`Station ${index + 1} name`} value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select aria-label={`${stage.name} camera`} value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{availableCameras.map((item) => { const assignedStage = process.stages.find((other) => other.id !== stage.id && other.cameraId === item.id); const plant = vision.plants.find((candidate) => candidate.id === item.plantId); const cameraName = item.name.trim() || item.id; return <option disabled={Boolean(assignedStage)} key={item.id} value={item.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></td><td><select aria-label={`${stage.name} zone`} disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole frame</option>{camera?.configuration.zones.map((zone) => { const active = camera.configuration.analysisRoiIds.includes(zone.id) && zone.width > 0 && zone.height > 0; return <option disabled={!active} key={zone.id} value={zone.id}>{zone.name}{active ? '' : ' · draw this zone first'}</option>; })}</select></td><td><button className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} aria-label={`Track worker at ${stage.name}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} start station`} checked={stage.type === 'entry'} name={`lpr-start-${process.id}`} onChange={() => setBoundary(stage.id, 'entry')} type="radio" /><i /></label></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} end station`} checked={stage.type === 'exit'} name={`lpr-end-${process.id}`} onChange={() => setBoundary(stage.id, 'exit')} type="radio" /><i /></label></td><td><button className="lm-delete-station" disabled={process.stages.length <= 2} aria-label={`Delete ${stage.name}`} onClick={() => deleteStation(stage)} type="button"><Trash2 size={14} /></button></td></tr>; })}</tbody></table></div></section>
+    <section className="lm-card lm-mapping"><header><Route size={20} /><div><h3>Ordered stations</h3><p>Choose one start and one end station. Each camera can be used once; its plant is shown so entry and exit cameras can be mapped across sites.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Order</th><th>Station name</th><th>Camera</th><th>Zone</th><th>Worker activity</th><th>Start</th><th>End</th><th>Actions</th></tr></thead><tbody>{process.stages.map((stage, index) => { const camera = vision.cameras.find((item) => item.id === stage.cameraId); return <tr key={stage.id}><td><div className="lm-order-actions"><button disabled={index === 0} aria-label={`Move ${stage.name} earlier`} onClick={() => moveStage(stage.id, -1)} type="button"><ArrowLeft size={13} /></button><strong>{index + 1}</strong><button disabled={index === process.stages.length - 1} aria-label={`Move ${stage.name} later`} onClick={() => moveStage(stage.id, 1)} type="button"><ArrowRight size={13} /></button></div></td><td><input aria-label={`Station ${index + 1} name`} value={stage.name} onChange={(event) => updateStage(stage.id, { name: event.target.value })} /></td><td><select aria-label={`${stage.name} camera`} value={stage.cameraId} onChange={(event) => updateStage(stage.id, { cameraId: event.target.value, zoneId: '' })}><option value="">Select camera</option>{availableCameras.map((item) => { const assignedStage = process.stages.find((other) => other.id !== stage.id && other.cameraId === item.id); const plant = vision.plants.find((candidate) => candidate.id === item.plantId); const cameraName = item.name.trim() || item.id; return <option disabled={Boolean(assignedStage)} key={item.id} value={item.id}>{cameraName}{assignedStage ? ` · assigned to ${assignedStage.name}` : plant ? ` · ${plant.name}` : ''}</option>; })}</select></td><td><select aria-label={`${stage.name} zone`} disabled={!camera} value={stage.zoneId} onChange={(event) => updateStage(stage.id, { zoneId: event.target.value })}><option value="">Whole frame</option>{camera?.configuration.zones.map((zone) => { const active = camera.configuration.analysisRoiIds.includes(zone.id) && zone.width > 0 && zone.height > 0; return <option disabled={!active} key={zone.id} value={zone.id}>{zone.name}{active ? '' : ' · draw this zone first'}</option>; })}</select></td><td><button className={`lm-toggle ${stage.trackWorker ? 'on' : ''}`} aria-label={`Track worker at ${stage.name}`} onClick={() => updateStage(stage.id, { trackWorker: !stage.trackWorker })} type="button"><i /></button></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} start station`} checked={stage.type === 'entry'} name={`lpr-start-${process.id}`} onChange={() => setBoundary(stage.id, 'entry')} type="radio" /><i /></label></td><td><label className="lm-radio-choice"><input aria-label={`${stage.name} end station`} checked={stage.type === 'exit'} name={`lpr-end-${process.id}`} onChange={() => setBoundary(stage.id, 'exit')} type="radio" /><i /></label></td><td><button className="lm-delete-station" disabled={process.stages.length <= 2} aria-label={`Remove ${stage.name}`} title={`Remove ${stage.name}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); deleteStation(stage); }} type="button"><Trash2 size={14} /><span>Remove</span></button></td></tr>; })}</tbody></table></div></section>
   </div>;
 }
 
-function LifecycleTracking({ process, openSummary }: { process: LprProcess; openSummary: (journey: LprJourney) => void }) {
+function LifecycleTracking({ process, openSummary, onManageStages }: { process: LprProcess; openSummary: (journey: LprJourney) => void; onManageStages?: () => void }) {
   const lpr = useLpr();
   const { now, refresh } = useLifecycleClock();
   const [query, setQuery] = useState('');
@@ -790,7 +855,7 @@ function LifecycleTracking({ process, openSummary }: { process: LprProcess; open
   const activeWorker = journeys.reduce((sum, item) => sum + journeyWorker(item, 'workingSeconds'), 0);
   const location = (journey: LprJourney) => {
     const visit = journey.visits[journey.visits.length - 1];
-    const stage = process.stages.find((item) => item.id === visit?.stageId);
+    const stage = findProcessStage(process, visit?.stageId);
     if (journey.status === 'completed') return 'Exited';
     if (visit?.leftAt) return 'Between stations';
     return now - (visit?.lastSeenAt ?? journey.lastActivityAt) > consecutiveFrameToleranceSeconds
@@ -808,7 +873,7 @@ function LifecycleTracking({ process, openSummary }: { process: LprProcess; open
     if (window.confirm(`Complete ${journey.plate} manually? Use this when the exit scan was missed.`)) lpr.completeJourney(journey.id);
   };
   return <div className="lm-stack">
-    <div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking</span><h2>Lifecycle Tracking</h2><p>Monitor confirmed vehicles, last-known station status, and evidence-based timings.</p></div></div>
+    <div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Lifecycle Tracking</span><h2>Lifecycle Tracking</h2><p>Monitor confirmed vehicles, last-known station status, and evidence-based timings.</p></div>{onManageStages ? <button className="lm-primary" onClick={onManageStages} type="button"><Settings2 size={15} />Manage stages</button> : null}</div>
     <section className="lm-card lm-filters">
       <label><span>Search vehicles</span><div><Search size={15} /><input placeholder="Search by vehicle number..." value={query} onChange={(event) => setQuery(event.target.value)} /></div></label>
       <label><span>Date</span><div><CalendarDays size={15} /><input aria-label="Journey date" type="date" value={date} onChange={(event) => setDate(event.target.value)} /></div></label>
@@ -825,7 +890,7 @@ function LifecycleTracking({ process, openSummary }: { process: LprProcess; open
     <div className="lm-tracking-grid">
       <section className="lm-card lm-entries"><header><List size={19} /><div><h3>Detected vehicle entries</h3><p>Select a row to inspect the captured station sequence and timing evidence.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Vehicle</th><th>First seen</th><th>Current state</th><th>Last captured</th><th>Total elapsed</th><th>Status</th><th>Presence</th><th>Last seen</th><th>Actions</th></tr></thead><tbody>{visible.map((journey) => {
         const lastVisit = journey.visits[journey.visits.length - 1];
-        const lastStage = process.stages.find((item) => item.id === lastVisit?.stageId);
+        const lastStage = findProcessStage(process, lastVisit?.stageId);
         const stale = journey.status === 'active' && now - (journey.lastActivityAt ?? lastVisit.lastSeenAt) > delayedAfterSeconds;
         const plateVisible = journey.status === 'active' && now - lastVisit.lastSeenAt <= consecutiveFrameToleranceSeconds;
         return <tr key={journey.id} onClick={() => openSummary(journey)}><td><strong>{journey.plate}</strong></td><td>{new Date(journey.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td>{location(journey)}</td><td>{lastStage?.name ?? 'Unknown'}</td><td>{shortDuration(journeyTotal(journey, now))}</td><td><span className={`lm-badge ${stale ? 'stale' : journey.status}`}>{stale ? 'Needs review' : journey.status === 'active' ? 'In progress' : 'Completed'}</span></td><td><span className={`lm-live ${stale ? 'orange' : plateVisible ? 'green' : 'gray'}`}><i />{journey.status === 'completed' ? 'Exited' : plateVisible ? 'Visible' : 'Last known'}</span></td><td>{new Date(lastVisit.lastSeenAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td><div className="lm-row-actions">{journey.status === 'active' ? <button title="Complete journey manually" type="button" onClick={(event) => { event.stopPropagation(); completeJourney(journey); }}><Check size={14} /></button> : null}<button title="Correct plate number" type="button" onClick={(event) => { event.stopPropagation(); correctPlate(journey); }}><Pencil size={14} /></button><button title="Delete vehicle record" type="button" onClick={(event) => { event.stopPropagation(); deleteJourney(journey); }}><Trash2 size={14} /></button></div></td></tr>;
@@ -862,7 +927,7 @@ function LifecycleAutomations({ process }: { process: LprProcess }) {
   const update = (id: string, value: Partial<LifecycleAutomation>) => setAutomations((items) => items.map((item) => item.id === id ? { ...item, ...value } : item));
   const processAutomations = automations.filter((item) => item.processId === process.id);
   const stationNames = (item: LifecycleAutomation) => {
-    const resolved = item.stationIds.map((id) => process.stages.find((stage) => stage.id === id)?.name ?? id);
+    const resolved = item.stationIds.map((id) => findProcessStage(process, id)?.name ?? id);
     return [...resolved, ...item.unresolvedStationNames];
   };
   return <div className="lm-stack"><div className="lm-page-head"><div><span>Lifecycle Management <ArrowRight size={12} /> Automations</span><h2>Lifecycle Automations</h2><p>Send real-time updates to customers and admins based on captured station events.</p></div></div><section className="lm-card lm-automation-create"><label><span>Trigger Event *</span><select value={trigger} onChange={(event) => setTrigger(event.target.value)}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Worker idle too long</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span>Recipients *</span><select value={audience} onChange={(event) => setAudience(event.target.value)}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span>Channel *</span><select value={channel} onChange={(event) => setChannel(event.target.value)}><option>WhatsApp</option><option>Email</option></select></label><button className="lm-primary" onClick={() => setAutomations((items) => [...items, { id: `automation-${Date.now()}`, name: `${trigger} Update`, audience, trigger, channels: [channel], processId: process.id, stationIds: [], unresolvedStationNames: [], shareImage: false, active: true }])} type="button"><Plus size={17} />Create Automation</button></section><div className="lm-automation-cards">{processAutomations.slice(0, 2).map((item, index) => <section className="lm-card" key={item.id}><header><div className={index ? 'orange' : 'green'}><Users size={20} /></div><span><h3>{item.name}</h3><p>{index ? 'Notify admins when a vehicle leaves a station or on stage completion.' : 'Notify customers when their vehicle reaches a station.'}</p></span><button className={`lm-toggle ${item.active ? 'on' : ''}`} onClick={() => update(item.id, { active: !item.active })} type="button"><i /></button><MoreHorizontal size={17} /></header><div className="lm-auto-grid"><label><span><Zap size={14} />Trigger Event</span><select value={item.trigger} onChange={(event) => update(item.id, { trigger: event.target.value })}><option>Vehicle reached station</option><option>Vehicle left station</option><option>Vehicle delayed</option><option>Vehicle exited end station</option></select></label><label><span><UserRound size={14} />Recipients</span><select value={item.audience} onChange={(event) => update(item.id, { audience: event.target.value })}><option>Customer</option><option>Admin / Workshop Manager</option></select></label><label><span><List size={14} />Stations / Events</span><div className="lm-tags">{(stationNames(item).length ? stationNames(item) : process.stages.slice(1, 5).map((stage) => stage.name)).map((name) => <i key={name}>{name}</i>)}</div></label><label><span>Channels</span><div className="lm-channel"><MessageCircle size={16} />WhatsApp<button className={`lm-toggle ${item.channels.includes('WhatsApp') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('WhatsApp') ? item.channels.filter((value) => value !== 'WhatsApp') : [...item.channels, 'WhatsApp'] })} type="button"><i /></button></div><div className="lm-channel"><Mail size={16} />Email<button className={`lm-toggle ${item.channels.includes('Email') ? 'on' : ''}`} onClick={() => update(item.id, { channels: item.channels.includes('Email') ? item.channels.filter((value) => value !== 'Email') : [...item.channels, 'Email'] })} type="button"><i /></button></div></label></div><label className="lm-share"><Image size={15} />Share station image<button className={`lm-toggle ${item.shareImage ? 'on' : ''}`} onClick={() => update(item.id, { shareImage: !item.shareImage })} type="button"><i /></button></label><div className="lm-message"><MessageCircle size={15} /><span><small>Message Preview</small><strong>{item.audience === 'Customer' ? 'Your vehicle MH12AB1234 has reached Inspection.' : 'Vehicle MH12AB1234 completed Inspection. Stage time: 48 min.'}</strong></span></div></section>)}</div><div className="lm-automation-bottom"><section className="lm-card lm-active-automations"><header><List size={18} /><div><h3>Active Automations</h3><p>Manage your configured automations for lifecycle notifications.</p></div></header><div className="lm-table-wrap"><table><thead><tr><th>Automation Name</th><th>Audience</th><th>Channels</th><th>Share Image</th><th>Status</th><th>Actions</th></tr></thead><tbody>{processAutomations.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.audience}</td><td>{item.channels.join(' · ')}</td><td>{item.shareImage ? 'Yes' : 'No'}</td><td><span className={`lm-status ${item.active ? 'green' : 'gray'}`}><i />{item.active ? 'Active' : 'Inactive'}</span></td><td><button type="button"><Pencil size={14} /></button><button type="button"><MoreHorizontal size={14} /></button></td></tr>)}</tbody></table></div></section><aside className="lm-card lm-triggers"><header><Settings2 size={18} /><div><h3>Available Triggers</h3><p>Events that can start an automation.</p></div></header>{['Vehicle Entered Start Station', 'Vehicle Reached Station', 'Worker Idle Too Long', 'Vehicle Delayed', 'Vehicle Exited End Station'].map((item) => <button type="button" key={item}><Zap size={14} />{item}<ArrowRight size={14} /></button>)}</aside></div></div>;
@@ -902,7 +967,7 @@ function LifecyclePlateStatus({ process }: { process: LprProcess }) {
 
 type LifecycleWorkspaceSection = 'tracking' | 'mapping' | 'automations';
 
-export function LprTrackingPage({ initialSection = 'tracking' }: { initialSection?: LifecycleWorkspaceSection }) {
+export function LprTrackingPage({ initialSection = 'tracking', onManageStages }: { initialSection?: LifecycleWorkspaceSection; onManageStages?: () => void }) {
   const vision = useVision();
   const lpr = useLpr();
   void initialSection;
@@ -928,6 +993,7 @@ export function LprTrackingPage({ initialSection = 'tracking' }: { initialSectio
   const journey = lpr.journeys.find((item) => item.id === selectedJourneyId) ?? lpr.journeys.find((item) => item.processId === process?.id);
   if (!process) return <div className="lm-empty">No lifecycle process is configured.</div>;
   const entryStage = process.stages.find((stage) => stage.type === 'entry');
+  const exitStage = process.stages.find((stage) => stage.type === 'exit');
   const entryCamera = vision.cameras.find((camera) => camera.id === entryStage?.cameraId);
   const entryZone = entryStage?.zoneId ? entryCamera?.configuration.zones.find((zone) => zone.id === entryStage.zoneId) : undefined;
   const entryZoneReady = !entryStage?.zoneId || Boolean(entryZone && entryCamera?.configuration.analysisRoiIds.includes(entryZone.id) && entryZone.width > 0 && entryZone.height > 0);
@@ -936,7 +1002,11 @@ export function LprTrackingPage({ initialSection = 'tracking' }: { initialSectio
     ? 'The AI worker is offline.'
     : !lprModel?.installed
       ? 'Indian LPR is not installed in this worker. The external checkout and both LPR weights are required for OCR.'
-      : !entryStage?.cameraId
+    : !entryStage
+      ? 'No Start station is selected.'
+      : !exitStage
+        ? 'No End station is selected.'
+        : !entryStage.cameraId
         ? 'No camera is mapped to the start station.'
         : !entryCamera
           ? 'The start-station camera no longer exists.'
@@ -951,9 +1021,9 @@ export function LprTrackingPage({ initialSection = 'tracking' }: { initialSectio
                 : '';
   const openSummary = (item: LprJourney) => { setSelectedJourneyId(item.id); setShowSummary(true); };
   return <div className="lifecycle-module" onClick={(event) => { const target = event.target; if (target instanceof HTMLImageElement && (target.classList.contains('lm-candidate-image') || target.classList.contains('lm-journey-plate-image'))) setPreviewImage({ src: target.src, plate: target.alt }); }}>
-    <div className="lifecycle-operation-context"><Route size={17} /><span><strong>Operational tracking</strong><small>Station mapping and notification setup are managed in Setup.</small></span></div>
+    <div className="lifecycle-operation-context"><Route size={17} /><span><strong>Operational tracking</strong><small>Station mapping and notification setup are managed in Setup.</small></span>{onManageStages ? <button className="lm-secondary" onClick={onManageStages} type="button"><Settings2 size={15} />Manage stages</button> : null}</div>
     {lifecycleBlocker ? <div className="inline-status info"><AlertTriangle size={16} /><span><strong>Lifecycle capture is not ready</strong><small>{lifecycleBlocker} A journey is registered only after the mapped entry camera returns valid OCR text containing 6–12 characters, at least two letters, and at least two digits.</small></span></div> : null}
-    {section === 'tracking' ? <><LifecyclePlateStatus process={process} />{showSummary ? <LifecycleSummary process={process} journey={journey} back={() => setShowSummary(false)} /> : <LifecycleTracking process={process} openSummary={openSummary} />}</> : null}
+    {section === 'tracking' ? <><LifecyclePlateStatus process={process} />{showSummary ? <LifecycleSummary process={process} journey={journey} back={() => setShowSummary(false)} /> : <LifecycleTracking process={process} openSummary={openSummary} onManageStages={onManageStages} />}</> : null}
     {previewImage ? <div className="plate-preview-backdrop" role="presentation" onClick={() => setPreviewImage(null)}><section aria-label={`Plate preview ${previewImage.plate}`} aria-modal="true" className="plate-preview-modal" role="dialog" onClick={(event) => event.stopPropagation()}><header><span><small>NUMBER PLATE PREVIEW</small><strong>{previewImage.plate}</strong></span><button aria-label="Close plate preview" autoFocus onClick={() => setPreviewImage(null)} title="Close preview" type="button"><X size={22} /></button></header><div className="plate-preview-image-stage"><img alt={`Detected number plate ${previewImage.plate}`} src={previewImage.src} /></div><footer><span>Detected vehicle number</span><strong>{previewImage.plate}</strong><small>Click outside, press Escape, or use the close button to return.</small></footer></section></div> : null}
   </div>;
 }

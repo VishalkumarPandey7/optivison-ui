@@ -224,8 +224,16 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .lm-add-station > div > button { min-height: 42px; }
 .lm-add-station > small { display: block; margin-top: 11px; color: var(--muted); font-size: 10px; }
 .lm-order-actions { display: flex; align-items: center; gap: 5px; }
-.lm-order-actions button, .lm-delete-station { width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 7px; background: #fff; display: grid; place-items: center; cursor: pointer; }
+.lm-order-actions button { width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 7px; background: #fff; display: grid; place-items: center; cursor: pointer; }
+.lm-delete-station { position: relative; z-index: 1; min-width: 76px; height: 32px; padding: 0 9px; border: 1px solid #f4c7c7; border-radius: 7px; background: #fff7f7; color: #b42318; display: inline-flex; align-items: center; justify-content: center; gap: 5px; font-size: 10px; font-weight: 800; cursor: pointer; touch-action: manipulation; }
+.lm-delete-station:hover { border-color: #e98585; background: #ffeded; }
 .lm-order-actions button:disabled, .lm-delete-station:disabled { opacity: .35; cursor: not-allowed; }
+.station-delete-toast { position: fixed; right: 24px; bottom: 24px; z-index: 1000; width: min(460px, calc(100vw - 32px)); padding: 14px 14px 14px 16px; border: 1px solid #a7e3ca; border-radius: 12px; background: #f0fbf7; box-shadow: 0 18px 50px rgba(16, 24, 40, .18); color: #087552; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 10px; }
+.station-delete-toast > span { display: grid; gap: 2px; }
+.station-delete-toast strong { color: #075b42; font-size: 12px; }
+.station-delete-toast small { color: #347663; font-size: 10px; line-height: 1.4; }
+.station-delete-toast button { min-height: 32px; padding: 0 11px; border: 1px solid #82cfb5; border-radius: 8px; background: #fff; color: #075b42; font-size: 10px; font-weight: 800; cursor: pointer; }
+.station-delete-toast button:last-child { width: 32px; padding: 0; display: grid; place-items: center; }
 .lifecycle-process-picker { padding: 16px 18px; display: flex; align-items: end; gap: 18px; }
 .lifecycle-process-picker label { min-width: 260px; display: grid; gap: 6px; font-size: 10px; font-weight: 700; }
 .lifecycle-process-picker select, .setup-automation-card input, .setup-automation-card select { min-height: 39px; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 0 10px; }
@@ -910,6 +918,7 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .lifecycle-operation-context { display: flex; align-items: flex-start; gap: 10px; margin-bottom: var(--space-4); color: var(--lm-navy); }
 .lifecycle-operation-context > svg { flex: 0 0 auto; margin-top: 2px; }
 .lifecycle-operation-context > span { display: grid; gap: 2px; }
+.lifecycle-operation-context > button { margin-left: auto; flex: 0 0 auto; }
 .lifecycle-operation-context strong { font-size: 14px; line-height: 1.3; }
 .lifecycle-operation-context small { color: var(--lm-muted); font-size: var(--text-xs); line-height: 1.45; }
 .lm-navigation { display: flex; gap: 4px; margin: -8px 0 15px; padding: 4px; width: fit-content; border: 1px solid var(--lm-border); border-radius: 10px; background: #fff; }
@@ -1459,10 +1468,12 @@ button, input, select, textarea { line-height: 1.35; }
   .setup-lifecycle-step .lm-mapping th:nth-child(1) { width: 14%; }
   .setup-lifecycle-step .lm-mapping th:nth-child(2), .setup-lifecycle-step .lm-mapping th:nth-child(3), .setup-lifecycle-step .lm-mapping th:nth-child(4) { width: 18%; }
   .setup-lifecycle-step .lm-mapping th:nth-child(5) { width: 14%; }
-  .setup-lifecycle-step .lm-mapping th:nth-child(6), .setup-lifecycle-step .lm-mapping th:nth-child(7), .setup-lifecycle-step .lm-mapping th:nth-child(8) { width: 6%; }
+  .setup-lifecycle-step .lm-mapping th:nth-child(6), .setup-lifecycle-step .lm-mapping th:nth-child(7) { width: 6%; }
+  .setup-lifecycle-step .lm-mapping th:nth-child(8) { width: 8%; }
   .setup-lifecycle-step .lm-mapping td input, .setup-lifecycle-step .lm-mapping td select { min-width: 0; padding-inline: 6px; text-overflow: ellipsis; }
   .setup-lifecycle-step .lm-order-actions { gap: 3px; }
-  .setup-lifecycle-step .lm-order-actions button, .setup-lifecycle-step .lm-delete-station { width: 26px; height: 30px; }
+  .setup-lifecycle-step .lm-order-actions button { width: 26px; height: 30px; }
+  .setup-lifecycle-step .lm-delete-station { min-width: 66px; height: 30px; padding-inline: 6px; }
   .lm-filters > button { grid-column: 1 / -1; width: 100%; }
   .lm-tracking-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

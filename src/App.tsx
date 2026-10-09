@@ -1276,7 +1276,7 @@ export function App() {
     if (page === 'camera-detail') return <CameraDetail setPage={setPage} />;
     if (page === 'dashboard') return <DashboardPage />;
     if (page === 'lpr-cycle') return <LegacyLifecycleSetupRedirect setPage={setPage} />;
-    if (page === 'lpr-tracking') return <LprTrackingPage />;
+    if (page === 'lpr-tracking') return <LprTrackingPage onManageStages={() => setPage('lpr-cycle')} />;
     if (page === 'notifications') return <NotificationsPage setPage={setPage} />;
     return <MonitoringPage setPage={setPage} />;
   }, [page]);
