@@ -4,6 +4,7 @@ import {
   createEmptySessionMetrics,
   defaultOperationalMetricConfiguration,
   migrateSessionMetrics,
+  resolveMetricBinding,
   resetSessionMetrics
 } from '../tmp/operational-metrics-validation/operationalMetrics.js';
 
@@ -26,6 +27,11 @@ const frame = ({ working = false, idle = false, absent = false, running = false,
 });
 
 const now = new Date(2026, 9, 8, 9, 0, 0).getTime() / 1000;
+const multiPerson = resolveMetricBinding(
+  { source: 'signal', sourceId: 'person-in-operator-zone' },
+  { signals: [{ signalId: 'person-in-operator-zone', active: true, value: true, evidence: { inZoneCount: 3, trackIds: [12, 8, 11] } }], rules: [] }
+);
+assert.equal(multiPerson.value, 3, 'worker-present metrics must use the detected in-zone count instead of converting active=true to 1');
 const legacy = { activeSeconds: 14, idleSeconds: 8, absentSeconds: 2, uptimeSeconds: 11, downtimeSeconds: 3, lastTimestamp: 99 };
 const migrated = migrateSessionMetrics(undefined, legacy, schedule, now);
 assert.equal(migrated.version, 2, 'legacy metrics must migrate to version 2');

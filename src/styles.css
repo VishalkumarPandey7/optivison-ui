@@ -573,6 +573,41 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .camera-parameters-empty > span strong, .camera-parameters-empty > span small { display: block; }
 .camera-parameters-empty > span strong { color: var(--ink); font-size: 10px; }
 .camera-parameters-empty > span small { margin-top: 3px; font-size: 8px; }
+.person-activity-panel { border-top: 1px solid var(--line); background: #fbfaf9; }
+.person-activity-panel.panel { padding: 18px; border: 1px solid var(--line); border-radius: 14px; }
+.person-activity-panel > header { padding: 10px 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+.person-activity-panel > header > span { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.person-activity-panel > header > span > span { min-width: 0; }
+.person-activity-panel > header strong, .person-activity-panel > header small { display: block; }
+.person-activity-panel > header strong { font-size: 10px; }
+.person-activity-panel > header small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.person-summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.person-summary b { border-radius: 999px; background: #eef2f5; padding: 4px 7px; color: #536070; font-size: 8px; white-space: nowrap; }
+.person-activity-list { max-height: 270px; overflow: auto; }
+.person-activity-row { display: grid; grid-template-columns: minmax(58px, .45fr) minmax(0, 1.55fr); align-items: start; gap: 8px; padding: 9px 13px; border-bottom: 1px solid var(--line); }
+.person-activity-row:last-child { border-bottom: 0; }
+.person-activity-row > span > small { display: block; margin-top: 3px; color: var(--muted); font-size: 8px; }
+.person-id { font-size: 10px; color: var(--ink); }
+.person-state { display: inline-flex; border-radius: 999px; padding: 3px 7px; background: #eef2f5; color: #66717d; font-size: 8px; }
+.person-state.working { background: #dcf8eb; color: #087a58; }
+.person-state.idle { background: #fff1dc; color: #a85b05; }
+.person-state.present { background: #e8f2ff; color: #1768b2; }
+.person-state.not-visible { background: #f0eeee; color: #7f7872; }
+.person-visit-segments { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.person-visit-segments em { border: 1px solid #e6dfd8; border-radius: 5px; padding: 2px 5px; color: #766d64; background: #fff; font-size: 7px; font-style: normal; }
+.person-activity-empty { min-height: 62px; padding: 12px 14px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--muted); }
+.person-activity-empty strong, .person-activity-empty small { display: block; }
+.person-activity-empty strong { color: var(--ink); font-size: 9px; }
+.person-activity-empty small { margin-top: 2px; font-size: 8px; }
+.person-activity-detail { border-bottom: 1px solid var(--line); background: #fff; }
+.person-activity-detail summary { display: grid; grid-template-columns: 120px 90px repeat(5, minmax(80px, 1fr)); align-items: center; gap: 10px; padding: 12px; cursor: pointer; list-style-position: outside; }
+.person-activity-detail summary > span small, .person-activity-detail summary > span strong { display: block; }
+.person-activity-detail summary > span small { color: var(--muted); font-size: 8px; }
+.person-activity-detail summary > span strong { margin-top: 2px; font-size: 10px; }
+.person-visit-list { padding: 0 12px 12px 34px; }
+.person-visit-list > div { display: grid; grid-template-columns: minmax(240px, 1fr) repeat(3, 90px); gap: 12px; padding: 8px 10px; border-radius: 7px; background: #f8f6f4; margin-top: 5px; }
+.person-visit-list small, .person-visit-list strong { display: block; font-size: 8px; }
+.person-visit-list small { color: var(--muted); }
 .detail-heading { display: flex; justify-content: space-between; align-items: center; }
 .detail-heading > div:first-child > span { display: flex; align-items: center; gap: 6px; color: var(--green); font-size: 9px; font-weight: 800; }
 .detail-heading > div:first-child > span i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }

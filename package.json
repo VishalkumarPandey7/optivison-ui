@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "validate:migrations": "tsc src/state/migrations.ts --outDir tmp/migration-validation --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tools/validate-state-migrations.mjs",
     "validate:metrics": "tsc src/state/operationalMetrics.ts --outDir tmp/operational-metrics-validation --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tools/validate-operational-metrics.mjs",
-    "check": "npm run typecheck && npm run validate:migrations && npm run validate:metrics && npm run build"
+    "validate:people": "tsc src/state/personActivity.ts --outDir tmp/person-activity-validation --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tools/validate-person-activity.mjs",
+    "check": "npm run typecheck && npm run validate:migrations && npm run validate:metrics && npm run validate:people && npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

@@ -27,9 +27,16 @@ import {
   type CameraCardMetric,
   type PlantRecord
 } from './state/migrations';
+import {
+  advancePersonActivity,
+  expirePersonActivity,
+  migratePersonActivityStore,
+  type PersonActivityStore
+} from './state/personActivity';
 
 export { workerUrl } from './services/workerApi';
 export type { SessionMetrics } from './state/operationalMetrics';
+export type { PersonActivityRecord, PersonActivityState, PersonActivityVisit } from './state/personActivity';
 
 export type SourceType = 'browser' | 'uploaded' | 'usb' | 'http' | 'rtsp' | 'onvif' | 'nvr';
 export type SourceStatus = 'empty' | 'starting' | 'ready' | 'error';
@@ -280,6 +287,7 @@ interface VisionContextValue {
   running: Record<string, boolean>;
   events: RuntimeEvent[];
   metrics: Record<string, SessionMetrics>;
+  personActivity: PersonActivityStore;
   setActiveCameraId: (cameraId: string) => void;
   setSelectedPlantId: (plantId: string) => void;
   addPlant: (name: string) => PlantRecord;
@@ -391,6 +399,7 @@ const eventsStorageKey = 'optivision-runtime-events-v1';
 const legacyMetricsStorageKey = 'optivision-session-metrics-v1';
 const metricsStorageKey = 'optivision-operational-metrics-v2';
 const metricsStorageBackupKey = 'optivision-session-metrics-v1:backup:pre-operational-metrics-v2';
+const personActivityStorageKey = 'optivision-person-activity-v1';
 const mediaDatabaseName = 'optivision-media-v1';
 const mediaStoreName = 'camera-sources';
 interface StoredCameraMedia {
@@ -594,6 +603,9 @@ export function VisionProvider({ children }: { children: ReactNode }) {
       migrateSessionMetrics(saved[camera.id], legacy[camera.id], camera.configuration.operationalMetrics.shift, timestamp)
     ]));
   });
+  const [personActivity, setPersonActivity] = useState<PersonActivityStore>(() => (
+    migratePersonActivityStore(readStoredJson<unknown>(personActivityStorageKey, {}))
+  ));
   const cameraRef = useRef(cameras);
   // Runtime videos stay mounted inside VisionProvider and are the only source
   // used for inference. Page-level videos are previews and may mount/unmount as
@@ -634,6 +646,22 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     const persistable = Object.fromEntries(Object.entries(metrics).map(([cameraId, value]) => [cameraId, { ...value, lastTimestamp: null, workerState: 'unknown', machineState: 'unknown' }]));
     writeStoredJson(metricsStorageKey, persistable);
   }, [metrics]);
+  useEffect(() => { writeStoredJson(personActivityStorageKey, personActivity); }, [personActivity]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const timestamp = Date.now() / 1000;
+      setPersonActivity((current) => {
+        let changed = false;
+        const next = Object.fromEntries(Object.entries(current).map(([cameraId, records]) => {
+          const expired = expirePersonActivity(records, timestamp);
+          if (expired !== records) changed = true;
+          return [cameraId, expired];
+        }));
+        return changed ? next : current;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const refreshModels = useCallback(async () => {
     try {
@@ -903,6 +931,12 @@ export function VisionProvider({ children }: { children: ReactNode }) {
       if (!camera || !previous) return current;
       return { ...current, [cameraId]: resetSessionMetrics(previous, camera.configuration.operationalMetrics.shift) };
     });
+    setPersonActivity((current) => {
+      if (!current[cameraId]) return current;
+      const next = { ...current };
+      delete next[cameraId];
+      return next;
+    });
     lastOutputs.current[cameraId] = [];
   }, []);
 
@@ -949,6 +983,12 @@ export function VisionProvider({ children }: { children: ReactNode }) {
     setCameras((current) => current.filter((camera) => camera.id !== cameraId));
     setRunning((current) => { const next = { ...current }; delete next[cameraId]; return next; });
     setFrames((current) => { const next = { ...current }; delete next[cameraId]; return next; });
+    setPersonActivity((current) => {
+      if (!current[cameraId]) return current;
+      const next = { ...current };
+      delete next[cameraId];
+      return next;
+    });
     setActiveCameraId((current) => current === cameraId ? cameraRef.current.find((camera) => camera.id !== cameraId)?.id ?? 'camera-1' : current);
   }, [stopSource]);
 
@@ -1024,6 +1064,17 @@ export function VisionProvider({ children }: { children: ReactNode }) {
             response.receivedAt = Date.now() / 1000;
             response.sourceImage = analysisImage;
             setFrames((current) => ({ ...current, [camera.id]: response }));
+            const operatorZoneIds = drawnZones.filter((zone) => zone.kind === 'operator').map((zone) => zone.id);
+            setPersonActivity((current) => ({
+              ...current,
+              [camera.id]: advancePersonActivity(
+                current[camera.id] ?? [],
+                camera.id,
+                response,
+                response.timestamp,
+                { scopeZoneIds: operatorZoneIds }
+              )
+            }));
             const previous = new Set(lastOutputs.current[camera.id] ?? []);
             const freshOutputs = response.outputs.filter((output) => !previous.has(output));
             if (freshOutputs.length) setEvents((current) => [...freshOutputs.map((output) => ({ id: `${camera.id}-${output}-${response.timestamp}`, cameraId: camera.id, timestamp: response.timestamp, type: 'rule' as const, title: output.replaceAll('_', ' '), detail: `${camera.name} rule output` })), ...current].slice(0, 500));
@@ -1073,11 +1124,11 @@ export function VisionProvider({ children }: { children: ReactNode }) {
   const getCamera = useCallback((cameraId?: string) => cameras.find((camera) => camera.id === (cameraId ?? activeCameraId)) ?? cameras[0], [activeCameraId, cameras]);
 
   const value = useMemo<VisionContextValue>(() => ({
-    workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics,
+    workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics, personActivity,
     setActiveCameraId, setSelectedPlantId, addPlant, updatePlant, getCamera, updateCamera, updateConfiguration, addCamera, addCameras, removeCamera,
     setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera,
     toggleEngine, resetCamera, refreshModels
-  }), [workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics, addPlant, updatePlant, getCamera, updateCamera, updateConfiguration, addCamera, addCameras, removeCamera, setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera, toggleEngine, resetCamera, refreshModels]);
+  }), [workerStatus, workerDetail, models, cameras, plants, selectedPlantId, activeCameraId, frames, running, events, metrics, personActivity, addPlant, updatePlant, getCamera, updateCamera, updateConfiguration, addCamera, addCameras, removeCamera, setVideoElement, connectBrowserCamera, connectUploadedVideo, connectExternalVideo, disconnectCamera, toggleEngine, resetCamera, refreshModels]);
 
   return <VisionContext.Provider value={value}>
     <div className="vision-runtime-layer" aria-hidden="true">

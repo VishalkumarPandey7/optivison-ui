@@ -61,6 +61,7 @@ import {
   type RuleDefinition,
   type SignalDefinition,
   type SignalKind,
+  type PersonActivityRecord,
   type TrainingAnnotation,
   type TrainingProject,
   type TrainingState,
@@ -76,6 +77,7 @@ import {
   type OperationalMetricBindingKey,
   type MetricTotals
 } from './state/operationalMetrics';
+import { summarizePersonActivity } from './state/personActivity';
 
 type Page =
   | 'setup-home'
@@ -225,6 +227,24 @@ function Pill({ children, tone = 'neutral' }: { children: React.ReactNode; tone?
   return <span className={`pill ${tone}`}>{children}</span>;
 }
 
+function formatActivityDuration(seconds: number) {
+  const safe = Math.max(0, Math.round(seconds));
+  if (safe < 60) return `${safe}s`;
+  if (safe < 3600) return `${Math.floor(safe / 60)}m ${safe % 60}s`;
+  return `${Math.floor(safe / 3600)}h ${Math.floor(safe % 3600 / 60)}m`;
+}
+
+function personStateLabel(state: PersonActivityRecord['state']) {
+  return state === 'not_visible' ? 'Not visible' : state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+function currentVisitDuration(record: PersonActivityRecord) {
+  const visit = record.visits[record.visits.length - 1];
+  if (!visit) return 0;
+  const liveTail = record.state === 'not_visible' ? 0 : Math.min(15, Math.max(0, Date.now() / 1000 - record.lastSeenAt));
+  return visit.presentSeconds + liveTail;
+}
+
 function Switch({ label, defaultOn = true, value, onChange }: { label: string; defaultOn?: boolean; value?: boolean; onChange?: (enabled: boolean) => void }) {
   const [localEnabled, setLocalEnabled] = useState(defaultOn);
   const enabled = value ?? localEnabled;
@@ -256,7 +276,7 @@ function EmptyFeed({
   // Inference runs independently from playback and may take several seconds
   // on CPU. Keep results briefly visible over the live feed, but never replace
   // the moving video with the captured analysis frame.
-  const displayedFrame = frame && Date.now() / 1000 - (frame.receivedAt ?? frame.timestamp) <= 2 ? frame : undefined;
+  const displayedFrame = frame && Date.now() / 1000 - (frame.receivedAt ?? frame.timestamp) <= 12 ? frame : undefined;
   const [playback, setPlayback] = useState({ current: 0, duration: 0 });
   const sourceReady = camera.sourceStatus === 'ready';
   const display = camera.configuration.display;
@@ -298,7 +318,18 @@ function EmptyFeed({
       {draftLine ? <svg className="live-count-line draft" viewBox="0 0 100 100" preserveAspectRatio="none"><line x1={draftLine.start.x} y1={draftLine.start.y} x2={draftLine.end.x} y2={draftLine.end.y} /></svg> : null}
       {display.boundingBoxes ? displayedFrame?.detections.map((detection) => {
         const [left, top, right, bottom] = detection.box;
-        const label = [display.labels ? (detection.plateText ? `PLATE ${detection.plateText}` : detection.className.toUpperCase()) : '', display.trackIds && !detection.plateText ? `#${detection.trackId}` : '', display.confidence ? `${Math.round(detection.confidence * 100)}%` : ''].filter(Boolean).join(' · ');
+        const personActivity = detection.className === 'person'
+          ? vision.personActivity[camera.id]?.find((record) => record.trackId === String(detection.trackId))
+          : undefined;
+        const label = [
+          display.labels ? (detection.plateText ? `PLATE ${detection.plateText}` : detection.className.toUpperCase()) : '',
+          display.trackIds && !detection.plateText
+            ? detection.className === 'person' ? personActivity ? `PERSON ${personActivity.displayId}` : 'PERSON' : `#${detection.trackId}`
+            : '',
+          display.trackIds && personActivity ? personStateLabel(personActivity.state).toUpperCase() : '',
+          display.trackIds && personActivity ? formatActivityDuration(currentVisitDuration(personActivity)) : '',
+          display.confidence ? `${Math.round(detection.confidence * 100)}%` : ''
+        ].filter(Boolean).join(' · ');
         return <div className="live-detection" key={detection.id} style={{ left: `${left / displayedFrame.width * 100}%`, top: `${top / displayedFrame.height * 100}%`, width: `${(right - left) / displayedFrame.width * 100}%`, height: `${(bottom - top) / displayedFrame.height * 100}%`, borderColor: display.detectionColor, borderWidth: `${display.boxThickness}px` }}>{label ? <span style={{ background: display.detectionColor }}>{label}</span> : null}</div>;
       }) : null}
       {countSignal ? <div className="live-count-badge"><small>OBJECTS PASSED</small><strong>{Number(countSignal.evidence.totalCount ?? countSignal.value ?? 0)}</strong></div> : null}
@@ -1106,15 +1137,17 @@ function ConfiguredMetricGrid({ cameraId, onConfigure }: { cameraId: string; onC
   const present = frame ? resolveMetricBinding(bindings.workerPresent, frame) : { state: 'unknown' as const, value: null };
   const working = frame ? resolveMetricBinding(bindings.workerWorking, frame) : { state: 'unknown' as const, value: null };
   const idle = frame ? resolveMetricBinding(bindings.workerIdle, frame) : { state: 'unknown' as const, value: null };
-  const people = present.value ?? 0;
+  const personSummary = summarizePersonActivity(vision.personActivity[cameraId] ?? []);
+  const hasTrackedPeople = Boolean(frame && (vision.personActivity[cameraId]?.length ?? 0));
+  const people = hasTrackedPeople ? personSummary.visible : present.value ?? 0;
   const observed = (session?.activeSeconds ?? 0) + (session?.idleSeconds ?? 0);
   const metrics = camera.configuration.monitoringMetrics;
   const hasLiveData = camera.sourceStatus === 'ready' && vision.workerStatus === 'online' && vision.running[cameraId] && Boolean(frame);
   function value(metric: CameraCardMetric) {
     if (!hasLiveData) return 'UNKNOWN';
     if (metric.id === 'worker-present') return present.state === 'unknown' ? 'UNKNOWN' : String(people);
-    if (metric.id === 'workers-working') return working.state === 'unknown' ? 'UNKNOWN' : String(working.state === 'active' ? people : 0);
-    if (metric.id === 'workers-idle') return idle.state === 'unknown' ? 'UNKNOWN' : String(idle.state === 'active' ? people : 0);
+    if (metric.id === 'workers-working') return hasTrackedPeople ? String(personSummary.working) : working.state === 'unknown' ? 'UNKNOWN' : String(working.state === 'active' ? people : 0);
+    if (metric.id === 'workers-idle') return hasTrackedPeople ? String(personSummary.idle) : idle.state === 'unknown' ? 'UNKNOWN' : String(idle.state === 'active' ? people : 0);
     if (metric.id === 'output-count') return session?.lastOutputValue === null || session?.lastOutputValue === undefined ? 'NO DATA' : String(Math.round(session.outputCount));
     if (metric.id === 'productivity') return observed ? `${Math.round((session?.activeSeconds ?? 0) / observed * 100)}%` : 'NO DATA';
     if (metric.id === 'machine-status') return session?.machineState.toUpperCase() ?? 'UNKNOWN';
@@ -1131,6 +1164,38 @@ function ConfiguredMetricGrid({ cameraId, onConfigure }: { cameraId: string; onC
     return '—';
   }
   return <section className="configured-parameters"><header><span><strong>User parameters</strong><small>{metrics.length ? hasLiveData ? `${metrics.length} live values` : 'Waiting for valid live evidence' : 'Nothing selected yet'}</small></span><button type="button" onClick={onConfigure}><Settings2 size={13} /> Choose parameters</button></header>{metrics.length ? <div className={`camera-parameters ${hasLiveData ? '' : 'no-data'}`}>{metrics.map((metric) => { const displayed = value(metric); return <span key={metric.id}><small>{metric.label}</small><strong className={metric.sourceId === 'machine_status' && displayed === 'RUNNING' ? 'success-text' : metric.sourceId === 'machine_status' && displayed === 'STOPPED' ? 'danger-text' : displayed === 'UNKNOWN' || displayed === 'NO DATA' ? 'unknown-text' : ''}>{displayed}</strong></span>; })}</div> : <div className="camera-parameters-empty"><Gauge size={19} /><span><strong>No monitoring parameters</strong><small>Choose Workers working, Productivity, or another configured value.</small></span></div>}</section>;
+}
+
+function PersonActivityPanel({ cameraId, compact = false }: { cameraId: string; compact?: boolean }) {
+  const vision = useVision();
+  const records = vision.personActivity[cameraId] ?? [];
+  const summary = summarizePersonActivity(records);
+  const sorted = [...records].sort((left, right) => {
+    const leftVisible = left.state === 'not_visible' ? 0 : 1;
+    const rightVisible = right.state === 'not_visible' ? 0 : 1;
+    return rightVisible - leftVisible || right.lastSeenAt - left.lastSeenAt;
+  });
+  const visibleRecords = sorted;
+  return <section className={`person-activity-panel ${compact ? 'compact' : 'panel'}`}>
+    <header>
+      <span><Users size={16} /><span><strong>Tracked people</strong><small>{records.length ? `${summary.visible} visible · ${records.length} IDs this session` : 'Waiting for confirmed person tracks'}</small></span></span>
+      {records.length ? <div className="person-summary"><b>{summary.working} working</b><b>{summary.idle} idle</b><b>{summary.present} unclassified</b></div> : null}
+    </header>
+    {visibleRecords.length ? <div className="person-activity-list">{visibleRecords.map((record) => {
+      const stateClass = record.state.replace('_', '-');
+      const detail = record.state === 'not_visible'
+        ? `Last seen ${new Date(record.lastSeenAt * 1000).toLocaleTimeString()}`
+        : `${formatActivityDuration(currentVisitDuration(record))} in current visit`;
+      if (compact) return <div className="person-activity-row" key={record.trackId}>
+        <strong className="person-id">Person {record.displayId}</strong>
+        <span><b className={`person-state ${stateClass}`}>{personStateLabel(record.state)}</b><small>{detail} · {formatActivityDuration(record.presentSeconds)} total</small><span className="person-visit-segments">{record.visits.slice(-3).map((visit, index) => <em key={visit.id}>Visit {Math.max(1, record.visits.length - 2 + index)}: {formatActivityDuration(visit.presentSeconds)}{visit.endedAt ? '' : ' now'}</em>)}</span></span>
+      </div>;
+      return <details className="person-activity-detail" key={record.trackId} open={record.state !== 'not_visible'}>
+        <summary><strong className="person-id">Person {record.displayId}</strong><b className={`person-state ${stateClass}`}>{personStateLabel(record.state)}</b><span><small>Current visit</small><strong>{record.state === 'not_visible' ? '—' : formatActivityDuration(currentVisitDuration(record))}</strong></span><span><small>Total present</small><strong>{formatActivityDuration(record.presentSeconds)}</strong></span><span><small>Working</small><strong>{formatActivityDuration(record.workingSeconds)}</strong></span><span><small>Idle</small><strong>{formatActivityDuration(record.idleSeconds)}</strong></span><span><small>Visits</small><strong>{record.visits.length}</strong></span></summary>
+        <div className="person-visit-list">{[...record.visits].reverse().map((visit, index) => <div key={visit.id}><span><strong>Visit {record.visits.length - index}</strong><small>{new Date(visit.startedAt * 1000).toLocaleString()} — {visit.endedAt ? new Date(visit.endedAt * 1000).toLocaleTimeString() : 'visible now'}</small></span><span><small>Present</small><strong>{formatActivityDuration(visit.presentSeconds)}</strong></span><span><small>Working</small><strong>{formatActivityDuration(visit.workingSeconds)}</strong></span><span><small>Idle</small><strong>{formatActivityDuration(visit.idleSeconds)}</strong></span></div>)}</div>
+      </details>;
+    })}</div> : <div className="person-activity-empty"><Users size={18} /><span><strong>No confirmed person IDs yet</strong><small>IDs appear after ByteTrack confirms a person inside the Worker Zone.</small></span></div>}
+  </section>;
 }
 
 function MonitoringCameraCard({ camera, setPage, onError }: { camera: CameraRecord; setPage: (page: Page) => void; onError: (message: string) => void }) {
@@ -1160,7 +1225,7 @@ function MonitoringCameraCard({ camera, setPage, onError }: { camera: CameraReco
   }
   const sourceReady = camera.sourceStatus === 'ready';
   const statusLabel = vision.running[camera.id] && vision.workerStatus !== 'online' ? 'Worker offline' : vision.running[camera.id] ? 'Detecting' : sourceReady ? 'Paused' : camera.sourceStatus === 'error' ? 'Source missing' : 'Not connected';
-  return <article className="monitor-card live-card"><button className="monitor-open" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('camera-detail'); }}><div className="monitor-feed"><EmptyFeed compact cameraId={camera.id} /><span className={`camera-status ${!sourceReady || machineState === 'stopped' ? 'stopped' : machineState === 'unknown' ? 'unknown' : ''}`}><i />{statusLabel}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{cameraName}</strong><small>{camera.location} · {camera.department}</small><em><Route size={12} />{assignment ? `${assignment.stage.name} · ${assignment.process.name}` : 'No station mapping'}</em></span><ChevronRight size={18} /></div></button><ConfiguredMetricGrid cameraId={camera.id} onConfigure={openParameterSetup} /><footer className="monitor-controls"><button className="secondary" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('add-camera'); }}><Settings2 size={14} />Configure</button>{sourceReady ? <button className={vision.running[camera.id] ? 'secondary' : 'primary'} type="button" onClick={() => void toggle()}>{vision.running[camera.id] ? <Pause size={14} /> : <Play size={14} />}{vision.running[camera.id] ? 'Pause engine' : 'Start engine'}</button> : <button className="primary" type="button" onClick={openSourceSetup}><Upload size={14} />Connect feed</button>}</footer>{actionError || camera.error ? <p className="camera-error-copy" role="alert">{actionError || camera.error}</p> : null}</article>;
+  return <article className="monitor-card live-card"><button className="monitor-open" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('camera-detail'); }}><div className="monitor-feed"><EmptyFeed compact cameraId={camera.id} /><span className={`camera-status ${!sourceReady || machineState === 'stopped' ? 'stopped' : machineState === 'unknown' ? 'unknown' : ''}`}><i />{statusLabel}</span><span className="expand"><Maximize2 size={15} /></span></div><div className="monitor-title"><span><strong>{cameraName}</strong><small>{camera.location} · {camera.department}</small><em><Route size={12} />{assignment ? `${assignment.stage.name} · ${assignment.process.name}` : 'No station mapping'}</em></span><ChevronRight size={18} /></div></button><ConfiguredMetricGrid cameraId={camera.id} onConfigure={openParameterSetup} /><PersonActivityPanel cameraId={camera.id} compact /><footer className="monitor-controls"><button className="secondary" type="button" onClick={() => { vision.setActiveCameraId(camera.id); setPage('add-camera'); }}><Settings2 size={14} />Configure</button>{sourceReady ? <button className={vision.running[camera.id] ? 'secondary' : 'primary'} type="button" onClick={() => void toggle()}>{vision.running[camera.id] ? <Pause size={14} /> : <Play size={14} />}{vision.running[camera.id] ? 'Pause engine' : 'Start engine'}</button> : <button className="primary" type="button" onClick={openSourceSetup}><Upload size={14} />Connect feed</button>}</footer>{actionError || camera.error ? <p className="camera-error-copy" role="alert">{actionError || camera.error}</p> : null}</article>;
 }
 
 function MonitoringPage({ setPage }: { setPage: (page: Page) => void }) {

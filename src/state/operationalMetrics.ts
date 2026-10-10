@@ -254,9 +254,18 @@ export function resolveMetricBinding(binding: MetricSourceBinding | null, frame:
   }
   const signal = frame.signals.find((item) => item.signalId === binding.sourceId);
   if (!signal) return { state: 'unknown', value: null };
-  const evidenceTotal = signal.evidence?.totalCount;
-  const value = typeof evidenceTotal === 'number' && Number.isFinite(evidenceTotal)
-    ? evidenceTotal
+  const evidenceValues = [
+    signal.evidence?.totalCount,
+    signal.evidence?.count,
+    signal.evidence?.inZoneCount,
+    signal.evidence?.candidateCount
+  ];
+  const evidenceValue = evidenceValues.find((item) => typeof item === 'number' && Number.isFinite(item));
+  const trackedCount = Array.isArray(signal.evidence?.trackIds) ? signal.evidence.trackIds.length : null;
+  const value = typeof evidenceValue === 'number'
+    ? evidenceValue
+    : trackedCount !== null
+      ? trackedCount
     : typeof signal.value === 'number' && Number.isFinite(signal.value)
       ? signal.value
       : signal.active ? 1 : 0;
